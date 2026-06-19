@@ -10,7 +10,7 @@ FARE 是当前项目保留的唯一多模态公平推荐框架版本。代码已
 FARE 结构为 ID sequential backbone 加多模态公平残差分支：
 
 ```text
-score(u, i) = score_id(u, i) + residual_score_weight * fair_weight * score_mm(u, i)
+score(u, i) = score_id(u, i) + residual_score_weight * fair_weight * score_res(u, i)
 ```
 
 训练公平机制使用 exposure-aware recommendation-loss reweighting。运行 FARE 前需要先准备一个参考 Top-K 文件，用于估计曝光分布。通常使用对应 ID backbone 在验证集上的 `topk_val.npz`。
