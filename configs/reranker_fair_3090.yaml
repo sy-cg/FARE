@@ -1,0 +1,134 @@
+# configs/reranker_fair_3090.yaml
+# FairRerank post-processing baseline config.
+#
+# CLI arguments override this YAML. Keep the metric setting aligned with the
+# main training scripts so table aggregation compares the same validation target.
+#
+# Recommended usage:
+#
+#   python scripts/run_reranker_fair.py \
+#     --dataset Video_Games \
+#     --backbone sasrec \
+#     --source_run_dir results/Video_Games/sasrec_id/20260515_194126 \
+#     --split all \
+#     --candidate_k 100 \
+#     --top_k 20 \
+#     --lambda_fair 0.2 \
+#     --lambda_popularity 0.0 \
+#     --groups all \
+#     --run_id sasrec_fair_rerank_video
+#
+# For GRU4Rec:
+#
+#   python scripts/run_reranker_fair.py \
+#     --dataset Video_Games \
+#     --backbone gru4rec \
+#     --source_run_dir results/Video_Games/gru4rec_id/<RUN_ID> \
+#     --split all \
+#     --candidate_k 100 \
+#     --top_k 20 \
+#     --lambda_fair 0.2 \
+#     --groups all \
+#     --run_id gru4rec_fair_rerank_video
+#
+# For BERT4Rec:
+#
+#   python scripts/run_reranker_fair.py \
+#     --dataset Video_Games \
+#     --backbone bert4rec \
+#     --source_run_dir results/Video_Games/bert4rec_id/<RUN_ID> \
+#     --split all \
+#     --candidate_k 100 \
+#     --top_k 20 \
+#     --lambda_fair 0.2 \
+#     --groups all \
+#     --run_id bert4rec_fair_rerank_video
+
+run_name: fair_rerank
+method_name: FairRerank
+seed: 2026
+
+default_dataset: Video_Games
+
+paths:
+  datasets_config: configs/datasets.yaml
+  result_root: results
+  log_root: logs
+
+source:
+  # This value should normally be overridden by CLI.
+  backbone: sasrec
+
+  # This must point to a trained source model directory containing:
+  #   topk_val.npz
+  #   topk_test.npz
+  #
+  # Example:
+  #   results/Video_Games/sasrec_id/20260515_194126
+  source_run_dir: null
+
+data:
+  # Default resolved from configs/datasets.yaml.
+  data_dir: null
+
+  group_matrix_file: item_group_matrix.npy
+  group_metadata: null
+  popularity_file: item_popularity_train.npy
+
+rerank:
+  # Run both val and test so best_metric can be based on val if available.
+  split: all
+
+  # Final recommendation length.
+  top_k: 20
+
+  # Candidate pool size before reranking.
+  # Source model must have saved top-100 candidates. Therefore source config
+  # should use eval.ks: [5, 10, 20, 100].
+  candidate_k: 100
+
+  # Metrics to report from reranked top-k.
+  ks: [5, 10, 20]
+  metric_for_best: ndcg@10
+
+  # Fairness groups:
+  #   all = use all available selected groups from item_group_matrix metadata
+  #
+  # Alternatively:
+  #   popularity_group,text_quality_group,vision_quality_group,category_proxy_group,brand_store_proxy_group,multimodal_cluster_proxy_group
+  groups: all
+
+  # Relevance-fairness trade-off.
+  alpha_relevance: 1.0
+  lambda_fair: 0.2
+
+  # Optional popularity penalty. Keep 0.0 for pure FairRerank baseline.
+  lambda_popularity: 0.0
+
+  # Fairness target distribution:
+  #   uniform   = encourage balanced group exposure
+  #   empirical = match catalog/group empirical distribution
+  target_distribution: uniform
+
+  # Group exposure deviation penalty:
+  #   l2      = smooth penalty, stable default
+  #   l1      = sharper sparse deviation penalty
+  #   max_gap = focus on worst group deviation
+  penalty: l2
+
+  # Candidate relevance score used during greedy reranking.
+  # log_rank is robust when source npz scores are not calibrated.
+  relevance_mode: log_rank
+
+  # Exposure discount by rank.
+  discount: log
+
+  normalize_group_rows: true
+  random_tie_break: false
+
+output:
+  # If null, script should use:
+  #   results/<Dataset>/<backbone>_fair_rerank/<run_id>
+  output_dir: null
+
+device: cpu

@@ -1,0 +1,125 @@
+# configs/freedom_3090.yaml
+# FREEDOM multimodal baseline config for AutoDL RTX 3090 24GB VRAM + 90GB RAM.
+#
+# Original FREEDOM config uses:
+#   embedding_size: 64
+#   feat_embed_dim: 64
+#   n_mm_layers: 1
+#   n_ui_layers: 2
+#   knn_k: 10
+#   mm_image_weight: 0.1
+#   dropout: [0.8, 0.9]
+#   reg_weight: [0.0, 1e-05, 1e-04, 1e-03]
+#
+# This project config uses:
+#   edge_dropout: 0.8
+#   reg_weight: 1.0e-4
+#
+# Example:
+#   python scripts/run_freedom.py \
+#     --dataset Video_Games \
+#     --config configs/freedom_3090.yaml \
+#     --run_id freedom_video
+#
+# Smoke test:
+#   python scripts/run_freedom.py \
+#     --dataset Video_Games \
+#     --config configs/freedom_3090.yaml \
+#     --epochs 2 \
+#     --run_id freedom_video_smoke
+
+run_name: freedom
+seed: 2026
+
+default_dataset: Video_Games
+
+paths:
+  datasets_config: configs/datasets.yaml
+  result_root: results
+  log_root: logs
+
+model:
+  # EvalNextItemDataset needs this for collate compatibility.
+  # FREEDOM itself ignores sequences during scoring.
+  max_seq_len: 50
+
+  embedding_dim: 64
+  feat_embed_dim: 64
+
+  n_mm_layers: 1
+  n_ui_layers: 2
+
+  knn_k: 10
+  knn_block_size: 1024
+
+  # Weight for vision item-item graph when both text and vision are available.
+  # mm_adj = image_weight * image_adj + (1 - image_weight) * text_adj
+  mm_image_weight: 0.1
+
+  # Original FREEDOM calls this "dropout"; it is user-item edge dropout.
+  # 0.8 means retaining around 20% of user-item edges each epoch.
+  edge_dropout: 0.8
+  degree_ratio: 1.0
+
+  # Auxiliary modality BPR loss weight.
+  reg_weight: 0.0001
+
+  # Optional explicit L2 over ID embeddings.
+  l2_weight: 0.0
+
+  text_feature_file: text_features.npy
+  vision_feature_file: vision_features.npy
+  text_mask_file: text_mask.npy
+  vision_mask_file: vision_mask.npy
+
+  use_text: true
+  use_vision: true
+
+  normalize_features: true
+  zero_missing_features: true
+  freeze_features: false
+
+  cache_item_graph: true
+  item_graph_cache_file: null
+
+  init_std: 0.01
+
+train:
+  epochs: 100
+
+  # FREEDOM uses BPR pairwise training. 2048 is usually safe for Video/Baby/Musical.
+  # For Sports, consider:
+  #   --batch_size 1024 --eval_every 2 --patience 5
+  batch_size: 2048
+
+  learning_rate: 0.001
+  weight_decay: 0.0
+  grad_clip_norm: 5.0
+
+  num_workers: 4
+  patience: 10
+  min_delta: 0.0
+  eval_every: 1
+  log_every: 100
+  pin_memory: true
+  save_best_only: true
+
+optimizer:
+  name: adamw
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+
+eval:
+  batch_size: 512
+
+  # Include 100 for compatibility with later reranking / analysis.
+  ks: [5, 10, 20, 100]
+
+  metric_for_best: ndcg@10
+  split_for_best: val
+  mask_seen_items: true
+  run_test_after_training: true
+  run_fairness_eval: true
+  save_topk_npz: true
+
+device: cuda

@@ -1,0 +1,32 @@
+# configs/datasets.yaml
+# Paths are relative to the SDR project root.
+
+data_root: data
+
+datasets:
+  All_Beauty:
+    path: data/Processed_All_Beauty
+    max_seq_len: 50
+    use_as_main_result: false
+    note: small dataset; recommended for sanity check, appendix, and case studies
+
+  Video_Games:
+    path: data/Processed_Video_Games
+    max_seq_len: 50
+    use_as_main_result: true
+
+  Musical_Instruments:
+    path: data/Processed_Musical_Instruments
+    max_seq_len: 50
+    use_as_main_result: true
+
+  Baby_Products:
+    path: data/Processed_Baby_Products
+    max_seq_len: 50
+    use_as_main_result: true
+
+  Sports_and_Outdoors:
+    path: data/Processed_Sports_and_Outdoors
+    max_seq_len: 50
+    use_as_main_result: true
+    note: include if preprocessing validation passes

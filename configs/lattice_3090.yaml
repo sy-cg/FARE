@@ -1,0 +1,138 @@
+# configs/lattice_3090.yaml
+# LATTICE multimodal baseline config for AutoDL RTX 3090 24GB VRAM + 90GB RAM.
+#
+# LATTICE original implementation:
+#   - image/text item-item kNN graphs
+#   - learnable modality fusion
+#   - lambda_coeff interpolation between learned graph and original graph
+#   - LightGCN/NGCF/MF collaborative graph branch
+#   - BPR training
+#
+# Example:
+#   python scripts/run_lattice.py \
+#     --dataset Video_Games \
+#     --config configs/lattice_3090.yaml \
+#     --run_id lattice_video
+#
+# Smoke test:
+#   python scripts/run_lattice.py \
+#     --dataset Video_Games \
+#     --config configs/lattice_3090.yaml \
+#     --epochs 2 \
+#     --run_id lattice_video_smoke
+
+run_name: lattice
+seed: 2026
+
+default_dataset: Video_Games
+
+paths:
+  datasets_config: configs/datasets.yaml
+  result_root: results
+  log_root: logs
+
+model:
+  # EvalNextItemDataset needs this for collate compatibility.
+  # LATTICE itself ignores sequences during scoring.
+  max_seq_len: 50
+
+  embedding_dim: 64
+  feat_embed_dim: 64
+
+  # Collaborative filtering branch:
+  #   lightgcn is the default and safest.
+  #   ngcf is supported but heavier.
+  #   mf is supported as a lightweight variant.
+  cf_model: lightgcn
+
+  # For LightGCN, weight_size only controls the number of UI graph layers.
+  # [64] means one user-item graph propagation layer.
+  weight_size: [64]
+  mess_dropout: [0.0]
+
+  # Item graph propagation layers.
+  n_item_layers: 1
+
+  # Item-item kNN graph.
+  topk: 10
+  knn_block_size: 1024
+
+  # Original LATTICE combines learned graph and original graph:
+  #   item_adj = (1 - lambda_coeff) * learned_adj + lambda_coeff * original_adj
+  lambda_coeff: 0.9
+
+  # L2 regularization coefficient for ID embeddings.
+  decay: 0.0001
+
+  text_feature_file: text_features.npy
+  vision_feature_file: vision_features.npy
+  text_mask_file: text_mask.npy
+  vision_mask_file: vision_mask.npy
+
+  use_text: true
+  use_vision: true
+
+  normalize_features: true
+  zero_missing_features: true
+  freeze_features: false
+
+  # Cache original image/text kNN graphs.
+  cache_item_graph: true
+  item_graph_cache_prefix: lattice
+
+  # If item count is larger than this value, dynamic learned graph construction
+  # falls back to cached original graph to avoid OOM.
+  dynamic_graph_max_items: 20000
+
+  # Clamp cosine similarity to non-negative values for graph normalization stability.
+  clamp_sim_min: 0.0
+
+  init_std: 0.01
+
+train:
+  epochs: 100
+
+  # LATTICE uses BPR pairwise training.
+  # 2048 is usually safe for Video/Baby/Musical.
+  # For Sports, consider:
+  #   --batch_size 1024 --eval_every 2 --patience 5
+  batch_size: 2048
+
+  learning_rate: 0.001
+  weight_decay: 0.0
+  grad_clip_norm: 5.0
+
+  num_workers: 4
+  patience: 10
+  min_delta: 0.0
+  eval_every: 1
+  log_every: 100
+  pin_memory: true
+  save_best_only: true
+
+optimizer:
+  # Original repo uses Adam.
+  name: adam
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+
+scheduler:
+  # Original repo uses LambdaLR: 0.96 ** (epoch / 50).
+  name: lambda
+  gamma: 0.96
+  interval: 50.0
+
+eval:
+  batch_size: 512
+
+  # Include 100 for compatibility with later reranking / analysis.
+  ks: [5, 10, 20, 100]
+
+  metric_for_best: ndcg@10
+  split_for_best: val
+  mask_seen_items: true
+  run_test_after_training: true
+  run_fairness_eval: true
+  save_topk_npz: true
+
+device: cuda

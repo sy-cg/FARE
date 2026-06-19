@@ -1,0 +1,164 @@
+# configs/modality_debias_3090.yaml
+# Generic ModalityDebias config for multimodal baselines.
+#
+# Supported base_model:
+#   vbpr
+#   bm3
+#   freedom
+#   lattice
+#   latefusion_sasrec
+#   latefusion_gru4rec
+#   latefusion_bert4rec
+#
+# Examples:
+#   python scripts/run_modality_debias.py \
+#     --dataset Video_Games \
+#     --base_model vbpr \
+#     --config configs/modality_debias_3090.yaml \
+#     --run_id vbpr_modality_debias_video
+#
+#   python scripts/run_modality_debias.py \
+#     --dataset Video_Games \
+#     --base_model latefusion_sasrec \
+#     --config configs/modality_debias_3090.yaml \
+#     --init_backbone_checkpoint results/Video_Games/sasrec_id/<RUN_ID>/best_model.pt \
+#     --run_id latefusion_sasrec_modality_debias_video
+
+run_name: modality_debias
+base_model: vbpr
+seed: 2026
+
+default_dataset: Video_Games
+
+paths:
+  datasets_config: configs/datasets.yaml
+  result_root: results
+  log_root: logs
+
+model:
+  # Used by sequential LateFusion variants.
+  max_seq_len: 50
+  hidden_size: 128
+  num_layers: 2
+  num_heads: 2
+  dropout: 0.2
+  activation: gelu
+  layer_norm_eps: 1.0e-12
+  tie_output_embedding: true
+
+base:
+  # Common multimodal features.
+  text_feature_file: text_features.npy
+  vision_feature_file: vision_features.npy
+  text_mask_file: text_mask.npy
+  vision_mask_file: vision_mask.npy
+  normalize_features: true
+  zero_missing_features: true
+  use_text: true
+  use_vision: true
+
+  # VBPR.
+  latent_dim: 64
+  visual_dim: 64
+
+  # BM3.
+  embedding_dim: 64
+  n_layers: 1
+  reg_weight: 0.01
+  cl_weight: 1.0
+
+  # FREEDOM.
+  feat_embed_dim: 64
+  n_mm_layers: 1
+  n_ui_layers: 2
+  knn_k: 10
+  mm_image_weight: 0.1
+  edge_dropout: 0.8
+
+  # LATTICE.
+  weight_size: [64]
+  mess_dropout: [0.0]
+  n_item_layers: 1
+  topk: 10
+  lambda_coeff: 0.9
+  cf_model: lightgcn
+  decay: 0.0001
+
+  # LateFusion-*.
+  mm_dim: 64
+  text_weight: 0.05
+  vision_weight: 0.05
+
+modality_debias:
+  branch_dim: 64
+  use_text: true
+  use_vision: true
+  branch_dropout: 0.0
+
+  # Training loss:
+  #   L = L_multi + branch_loss_weight * (L_text + L_vision)
+  branch_loss_weight: 1.0
+
+  # Paper searches alpha in {0.001, 0.01, 0.1, 1, 10}.
+  # Here ranks are normalized by default, so 5.0 is a reasonable start.
+  alpha: 5.0
+
+  # Counterfactual deduction scale.
+  debias_lambda: 1.0
+
+  # paper_product = closer to WWW'24 formulas.
+  # rank_subtract = more numerically stable for arbitrary base score scales.
+  counterfactual_mode: paper_product
+
+  # Counterfactual constant for fused item representation.
+  # user_mean is stable for full-sort scores.
+  base_counterfactual: user_mean
+
+  # Constant sigmoid probability for missing counterfactual modality.
+  cf_prob: 0.5
+
+  # If true, rank is in [0, 1].
+  # If false, raw rank is used.
+  rank_normalize: true
+
+  debias_min: 0.0
+  debias_max: 1.0
+
+train:
+  epochs: 100
+  batch_size: 512
+  learning_rate: 0.001
+  weight_decay: 0.0
+  grad_clip_norm: 5.0
+
+  num_workers: 4
+  patience: 10
+  min_delta: 0.0
+  eval_every: 1
+  log_every: 100
+  pin_memory: true
+
+  # true: train main branch with base * sigmoid(text) * sigmoid(vision)
+  # false: train base branch directly, closer to stable BPR optimization.
+  train_on_fused: false
+
+  # true: use every prefix in train sequences.
+  # false: use only last prefix per user.
+  use_all_prefixes: true
+
+optimizer:
+  name: adamw
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+
+eval:
+  batch_size: 512
+  ks: [5, 10, 20, 100]
+  metric_for_best: ndcg@10
+  split_for_best: val
+  mask_seen_items: true
+  run_test_after_training: true
+  run_fairness_eval: true
+  save_topk_npz: true
+
+device: cuda

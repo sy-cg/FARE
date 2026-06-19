@@ -1,0 +1,90 @@
+# configs/adv_sasrec_3090.yaml
+# Adv-SASRec config for RTX 3090.
+
+run_name: adv_sasrec
+method_name: Adv-SASRec
+seed: 2026
+
+default_dataset: Video_Games
+
+paths:
+  datasets_config: configs/datasets.yaml
+  result_root: results
+  log_root: logs
+
+model:
+  backbone: sasrec
+  max_seq_len: 50
+  hidden_size: 128
+  num_layers: 2
+  num_heads: 2
+  dropout: 0.2
+  activation: gelu
+  layer_norm_eps: 1.0e-12
+  tie_output_embedding: true
+
+adv:
+  groups:
+    - popularity_group
+    - text_quality_group
+    - vision_quality_group
+    - category_proxy_group
+    - brand_store_proxy_group
+    - multimodal_cluster_proxy_group
+
+  adv_loss_weight: 0.02
+  grl_lambda: 1.0
+
+  classifier_hidden_dim: 128
+  aux_dropout: 0.1
+  normalize_user_repr: false
+
+  group_loss_weights:
+    popularity_group: 1.0
+    text_quality_group: 1.0
+    vision_quality_group: 1.0
+    category_proxy_group: 0.6
+    brand_store_proxy_group: 0.8
+    multimodal_cluster_proxy_group: 0.8
+
+  min_group_count: 5
+  drop_rare_classes: true
+  use_class_balanced_aux_loss: true
+
+  freeze_id_backbone: false
+
+train:
+  epochs: 100
+  batch_size: 512
+  learning_rate: 0.0005
+  weight_decay: 0.0
+  label_smoothing: 0.0
+  grad_clip_norm: 5.0
+  num_workers: 4
+  patience: 10
+  min_delta: 0.0
+  eval_every: 1
+  log_every: 100
+  pin_memory: true
+  save_best_only: true
+
+optimizer:
+  name: adamw
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+
+scheduler:
+  name: none
+  warmup_epochs: 0
+
+eval:
+  batch_size: 512
+  ks: [5, 10, 20, 100]
+  metric_for_best: ndcg@10
+  split_for_best: val
+  mask_seen_items: true
+  run_test_after_training: true
+  run_fairness_eval: true
+  save_topk_npz: true
+
+device: cuda

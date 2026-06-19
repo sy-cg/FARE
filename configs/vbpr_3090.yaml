@@ -1,0 +1,90 @@
+# configs/vbpr_3090.yaml
+# VBPR baseline config for AutoDL RTX 3090 24GB VRAM + 90GB RAM.
+#
+# VBPR is a non-sequential visual recommendation baseline trained with BPR.
+# It uses user/item latent factors and fixed visual item features.
+#
+# Example:
+#   python scripts/run_vbpr.py \
+#     --dataset Video_Games \
+#     --config configs/vbpr_3090.yaml \
+#     --run_id vbpr_video
+#
+# Fairness evaluation:
+#   python scripts/eval_fairness.py \
+#     --dataset Video_Games \
+#     --run_dir results/Video_Games/vbpr/vbpr_video \
+#     --split test \
+#     --groups all \
+#     --append_global
+
+run_name: vbpr
+seed: 2026
+
+default_dataset: Video_Games
+
+paths:
+  datasets_config: configs/datasets.yaml
+  result_root: results
+  log_root: logs
+
+model:
+  # EvalNextItemDataset still needs max_seq_len for collate compatibility,
+  # but VBPR itself ignores sequences.
+  max_seq_len: 50
+
+  # VBPR latent factors.
+  latent_dim: 64
+  visual_dim: 64
+
+  # Visual feature file in data/Processed_<Dataset>/.
+  feature_file: vision_features.npy
+  mask_file: vision_mask.npy
+
+  normalize_features: true
+  zero_missing_features: true
+
+  dropout: 0.0
+  init_std: 0.01
+
+train:
+  epochs: 100
+
+  # VBPR pairwise BPR training is lightweight; 2048 is usually safe on 3090.
+  # If CPU negative sampling becomes bottleneck, reduce num_workers or batch size.
+  batch_size: 2048
+
+  # VBPR original examples often use SGD; AdamW is more stable in this pipeline.
+  learning_rate: 0.001
+  weight_decay: 1.0e-6
+
+  grad_clip_norm: 5.0
+
+  num_workers: 4
+  patience: 10
+  min_delta: 0.0
+  eval_every: 1
+  log_every: 100
+  pin_memory: true
+  save_best_only: true
+
+optimizer:
+  name: adamw
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+
+eval:
+  batch_size: 512
+
+  # Include 100 for compatibility with later FairRerank-style analysis.
+  # Main paper tables can still report @20.
+  ks: [5, 10, 20, 100]
+
+  metric_for_best: ndcg@10
+  split_for_best: val
+  mask_seen_items: true
+  run_test_after_training: true
+  run_fairness_eval: true
+  save_topk_npz: true
+
+device: cuda

@@ -1,0 +1,133 @@
+# configs/pop_reweight_3090.yaml
+# Popularity-reweighted CE baseline for ID-only sequential recommendation.
+#
+# Supported backbones are selected by CLI:
+#   --backbone sasrec
+#   --backbone gru4rec
+#   --backbone bert4rec
+#
+# Example:
+#   python scripts/run_pop_reweight.py \
+#     --dataset Video_Games \
+#     --config configs/pop_reweight_3090.yaml \
+#     --backbone sasrec \
+#     --run_id sasrec_pop_reweight_video
+#
+#   python scripts/run_pop_reweight.py \
+#     --dataset Video_Games \
+#     --config configs/pop_reweight_3090.yaml \
+#     --backbone gru4rec \
+#     --run_id gru4rec_pop_reweight_video
+#
+#   python scripts/run_pop_reweight.py \
+#     --dataset Video_Games \
+#     --config configs/pop_reweight_3090.yaml \
+#     --backbone bert4rec \
+#     --run_id bert4rec_pop_reweight_video
+
+run_name: pop_reweight
+method_name: PopReweight
+seed: 2026
+
+default_dataset: Video_Games
+
+paths:
+  datasets_config: configs/datasets.yaml
+  result_root: results
+  log_root: logs
+
+model:
+  # This value is only a default.
+  # scripts/run_pop_reweight.py should override this from --backbone.
+  backbone: sasrec
+
+  max_seq_len: 50
+  hidden_size: 128
+  num_layers: 2
+  num_heads: 2
+  dropout: 0.2
+  activation: gelu
+  layer_norm_eps: 1.0e-12
+  tie_output_embedding: true
+
+pop_reweight:
+  # Popularity counts are loaded from:
+  #   data/Processed_<Dataset>/item_popularity_train.npy
+  # If missing, script can compute counts from train.txt.
+  popularity_file: item_popularity_train.npy
+  fallback_to_train_sequences: true
+
+  # Weighting schemes:
+  #   inverse_log:
+  #       w_i = 1 / log(pop_i + offset)
+  #   inverse_sqrt:
+  #       w_i = 1 / sqrt(pop_i + offset)
+  #   inverse_power:
+  #       w_i = 1 / (pop_i + offset)^alpha
+  #
+  # inverse_log is usually the safest first choice.
+  scheme: inverse_log
+
+  # Used mainly by inverse_power.
+  # For inverse_log / inverse_sqrt, keeping this value is harmless.
+  alpha: 0.5
+
+  # Prevent extremely large or tiny target weights.
+  min_weight: 0.5
+  max_weight: 3.0
+
+  # Normalize item weights so average non-padding item weight is around 1.
+  normalize_to_mean: true
+
+  # Normalize each batch by average target weight.
+  # This keeps the effective learning scale stable.
+  normalize_batch_weight: true
+
+train:
+  epochs: 100
+
+  # 3090 24GB usually handles 512 for Video/Musical/Baby.
+  # For Sports_and_Outdoors, use CLI override:
+  #   --batch_size 256 --eval_every 2 --patience 5
+  batch_size: 512
+
+  # Slightly smaller than vanilla SASRec default is safer because reweighting
+  # changes gradient scale and tail items receive larger weights.
+  learning_rate: 0.0007
+
+  weight_decay: 0.0
+  label_smoothing: 0.0
+  grad_clip_norm: 5.0
+
+  num_workers: 4
+  patience: 10
+  min_delta: 0.0
+  eval_every: 1
+  log_every: 100
+  pin_memory: true
+  save_best_only: true
+
+optimizer:
+  name: adamw
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+
+scheduler:
+  name: none
+  warmup_epochs: 0
+
+eval:
+  batch_size: 512
+
+  # Include 100 so FairRerank can use top-100 candidates later.
+  # The compact tables can still report @20.
+  ks: [5, 10, 20, 100]
+
+  metric_for_best: ndcg@10
+  split_for_best: val
+  mask_seen_items: true
+  run_test_after_training: true
+  run_fairness_eval: true
+  save_topk_npz: true
+
+device: cuda

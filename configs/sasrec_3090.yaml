@@ -1,0 +1,64 @@
+# configs/sasrec_3090.yaml
+# Recommended SASRec-ID config for AutoDL RTX 3090 24GB VRAM + 90GB RAM.
+
+run_name: sasrec_id
+seed: 2026
+
+default_dataset: Video_Games
+
+paths:
+  datasets_config: configs/datasets.yaml
+  result_root: results
+  log_root: logs
+
+model:
+  max_seq_len: 50
+  hidden_size: 128
+  num_layers: 2
+  num_heads: 2
+  dropout: 0.2
+  activation: gelu
+  layer_norm_eps: 1.0e-12
+  tie_output_embedding: true
+
+train:
+  epochs: 100
+  # 3090 24G usually handles 512 for Video/Musical and often Baby.
+  # For Sports, start from 256; try 512 only after confirming no OOM and acceptable speed.
+  batch_size: 512
+  learning_rate: 0.001
+  weight_decay: 0.0
+  label_smoothing: 0.0
+  grad_clip_norm: 5.0
+  # AutoDL usually has enough CPU/RAM; tune 4/8 based on CPU cores and disk speed.
+  num_workers: 4
+  patience: 5
+  min_delta: 0.0
+  # For large datasets such as Sports_and_Outdoors, use CLI override --eval_every 2 or 3.
+  eval_every: 2
+  log_every: 100
+  pin_memory: true
+  save_best_only: true
+
+optimizer:
+  name: adamw
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+
+scheduler:
+  name: none
+  warmup_epochs: 0
+
+eval:
+  # Evaluation has no gradients. 3090 can usually handle 512 or 1024.
+  # For Sports, 512 is a safe starting point.
+  batch_size: 512
+  ks: [5, 10, 20, 100]
+  metric_for_best: ndcg@10
+  split_for_best: val
+  mask_seen_items: true
+  run_test_after_training: true
+  run_fairness_eval: true
+  save_topk_npz: true
+
+device: cuda

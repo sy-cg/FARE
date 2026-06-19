@@ -1,0 +1,106 @@
+# configs/bm3_3090.yaml
+# BM3 multimodal baseline config for AutoDL RTX 3090 24GB VRAM + 90GB RAM.
+#
+# Reference setting from official BM3 README:
+#   Baby:  layers=1, dropout=0.5, reg_weight=0.1
+#   Sports: layers=1, dropout=0.5, reg_weight=0.01
+#   Elec: layers=2, dropout=0.3, reg_weight=0.1
+#
+# This config uses a generally safe default:
+#   n_layers: 1
+#   dropout: 0.5
+#   reg_weight: 0.01
+#
+# Example:
+#   python scripts/run_bm3.py \
+#     --dataset Video_Games \
+#     --config configs/bm3_3090.yaml \
+#     --run_id bm3_video
+#
+# Smoke test:
+#   python scripts/run_bm3.py \
+#     --dataset Video_Games \
+#     --config configs/bm3_3090.yaml \
+#     --epochs 2 \
+#     --run_id bm3_video_smoke
+
+run_name: bm3
+seed: 2026
+
+default_dataset: Video_Games
+
+paths:
+  datasets_config: configs/datasets.yaml
+  result_root: results
+  log_root: logs
+
+model:
+  # EvalNextItemDataset needs this for collate compatibility.
+  # BM3 itself ignores sequences during scoring.
+  max_seq_len: 50
+
+  embedding_dim: 64
+  n_layers: 1
+
+  # Bootstrap target-view dropout.
+  dropout: 0.5
+
+  # L2 and modality bootstrap weights.
+  reg_weight: 0.01
+  cl_weight: 1.0
+
+  text_feature_file: text_features.npy
+  vision_feature_file: vision_features.npy
+  text_mask_file: text_mask.npy
+  vision_mask_file: vision_mask.npy
+
+  use_text: true
+  use_vision: true
+  normalize_features: true
+  zero_missing_features: true
+  freeze_features: false
+
+  # Usually false for LightGCN-style user-item graph.
+  add_self_loops: false
+
+  init_std: 0.01
+
+train:
+  epochs: 100
+
+  # BM3 is full-graph propagation + pairwise observed interactions.
+  # 2048 is usually safe on 3090 for Baby/Musical/Video.
+  # For Sports, consider --batch_size 1024 --eval_every 2.
+  batch_size: 2048
+
+  learning_rate: 0.001
+  weight_decay: 0.0
+  grad_clip_norm: 5.0
+
+  num_workers: 4
+  patience: 10
+  min_delta: 0.0
+  eval_every: 1
+  log_every: 100
+  pin_memory: true
+  save_best_only: true
+
+optimizer:
+  name: adamw
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+
+eval:
+  batch_size: 512
+
+  # Include 100 for compatibility with later reranking / analysis.
+  ks: [5, 10, 20, 100]
+
+  metric_for_best: ndcg@10
+  split_for_best: val
+  mask_seen_items: true
+  run_test_after_training: true
+  run_fairness_eval: true
+  save_topk_npz: true
+
+device: cuda

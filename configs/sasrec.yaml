@@ -1,0 +1,58 @@
+# configs/sasrec.yaml
+
+run_name: sasrec_id
+seed: 2026
+
+default_dataset: Video_Games
+
+paths:
+  datasets_config: configs/datasets.yaml
+  result_root: results
+  log_root: logs
+
+model:
+  max_seq_len: 50
+  hidden_size: 128
+  num_layers: 2
+  num_heads: 2
+  dropout: 0.2
+  activation: gelu
+  layer_norm_eps: 1.0e-12
+  tie_output_embedding: true
+
+train:
+  epochs: 100
+  batch_size: 256
+  learning_rate: 0.001
+  weight_decay: 0.0
+  label_smoothing: 0.0
+  grad_clip_norm: 5.0
+  num_workers: 2
+  patience: 10
+  min_delta: 0.0
+  eval_every: 1
+  log_every: 100
+  pin_memory: true
+  save_best_only: true
+
+optimizer:
+  name: adamw
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+
+scheduler:
+  name: none
+  # name: cosine
+  warmup_epochs: 0
+
+eval:
+  batch_size: 256
+  ks: [5, 10, 20, 100]
+  metric_for_best: ndcg@10
+  split_for_best: val
+  mask_seen_items: true
+  run_test_after_training: true
+  run_fairness_eval: true
+  save_topk_npz: true
+
+device: cuda
