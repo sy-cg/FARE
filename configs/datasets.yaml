@@ -30,3 +30,13 @@ datasets:
     max_seq_len: 50
     use_as_main_result: true
     note: include if preprocessing validation passes
+
+  MicroLens_100K:
+    path: data/Processed_MicroLens_100K
+    max_seq_len: 50
+    use_as_main_result: true
+    platform: short_video
+    interaction_behavior: video_view_sequence
+    modalities: [text, vision]
+    exposure_prior: platform_views.npy
+    note: external non-Amazon validation dataset; use text and cover-image features only

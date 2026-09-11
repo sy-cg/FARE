@@ -70,6 +70,8 @@ fare:
   fair_rec_reweight_min: 0.5
   fair_rec_reweight_max: 2.0
   fair_rec_exposure_topk_path: null
+  fair_rec_exposure_source: reference_topk
+  fair_rec_exposure_item_weights_path: null
   fair_rec_exposure_target: catalog
   fair_rec_exposure_k: 10
   allow_test_exposure_topk: false

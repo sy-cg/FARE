@@ -91,16 +91,14 @@ rerank:
   ks: [5, 10, 20]
   metric_for_best: ndcg@10
 
-  # Fairness groups:
-  #   all = use all available selected groups from item_group_matrix metadata
-  #
-  # Alternatively:
-  #   popularity_group,text_quality_group,vision_quality_group,category_proxy_group,brand_store_proxy_group,multimodal_cluster_proxy_group
-  groups: all
+  # Formal FairRR optimizes one coherent, cross-dataset item-group taxonomy.
+  # Other proxy-group endpoints remain external evaluation metrics.
+  groups: popularity_group
 
   # Relevance-fairness trade-off.
   alpha_relevance: 1.0
   lambda_fair: 0.2
+  lambda_fair_candidates: [0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0]
 
   # Optional popularity penalty. Keep 0.0 for pure FairRerank baseline.
   lambda_popularity: 0.0
@@ -125,6 +123,14 @@ rerank:
 
   normalize_group_rows: true
   random_tie_break: false
+  require_effective_change: true
+
+  # Validation-only lambda selection maximizes the configured exposure objective
+  # subject to a shared utility guard and material intervention thresholds.
+  max_relative_utility_loss: 0.05
+  min_rank_changed_user_rate: 0.01
+  min_set_changed_user_rate: 0.01
+  min_fairness_improvement: 1.0e-6
 
 output:
   # If null, script should use:
