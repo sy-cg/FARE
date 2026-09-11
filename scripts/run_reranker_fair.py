@@ -79,17 +79,26 @@ try:
     from reranker_fair import (  # type: ignore
         DEFAULT_RERANK_GROUPS,
         FairRerankConfig,
+        aggregate_exposure_penalty,
         build_popularity_penalty,
+        load_npz_topk,
         load_group_metadata,
         load_item_group_matrix,
         load_popularity,
+        rerank_topk_data,
         rerank_topk_file,
         select_group_columns,
     )
+    from revision_diagnostics import (  # type: ignore
+        candidate_pool_audit,
+        fairrr_candidate_group_diversity,
+        fairrr_change_summary,
+        validate_formal_fairrr,
+    )
 except ImportError as exc:  # pragma: no cover
     raise ImportError(
-        "Could not import src/reranker_fair.py. "
-        "Make sure it exists and passes py_compile."
+        "Could not import reranker or revision diagnostics. Make sure "
+        "src/reranker_fair.py and src/revision_diagnostics.py pass py_compile."
     ) from exc
 
 
@@ -183,6 +192,171 @@ def normalize_ks(value: Any, default: Sequence[int] = (5, 10, 20)) -> List[int]:
         return [int(x) for x in value]
     return [int(value)]
 
+
+def normalize_float_grid(value: Any, default: Sequence[float]) -> List[float]:
+    if value is None:
+        raw = list(default)
+    elif isinstance(value, str):
+        raw = [float(part.strip()) for part in value.split(",") if part.strip()]
+    elif isinstance(value, (list, tuple)):
+        raw = [float(part) for part in value]
+    else:
+        raw = [float(value)]
+
+    out: List[float] = []
+    for item in raw:
+        value = float(item)
+        if value not in out:
+            out.append(value)
+    return out
+
+
+def select_effective_lambda_fair(
+    topk_data: Dict[str, np.ndarray],
+    group_matrix: np.ndarray,
+    cfg: FairRerankConfig,
+    lambda_candidates: Sequence[float],
+    popularity_penalty: Optional[np.ndarray],
+    ks: Sequence[int],
+    metric_for_best: Optional[str] = None,
+    max_relative_utility_loss: float = 0.05,
+    min_rank_changed_user_rate: float = 0.0,
+    min_set_changed_user_rate: float = 0.0,
+    min_fairness_improvement: float = 0.0,
+) -> tuple[FairRerankConfig, Dict[str, Any]]:
+    """Select lambda on validation by fairness gain under explicit constraints."""
+    max_relative_utility_loss = float(max_relative_utility_loss)
+    min_rank_changed_user_rate = float(min_rank_changed_user_rate)
+    min_set_changed_user_rate = float(min_set_changed_user_rate)
+    min_fairness_improvement = float(min_fairness_improvement)
+    if not 0.0 <= max_relative_utility_loss <= 1.0:
+        raise ValueError("max_relative_utility_loss must be in [0, 1]")
+    for name, value in (
+        ("min_rank_changed_user_rate", min_rank_changed_user_rate),
+        ("min_set_changed_user_rate", min_set_changed_user_rate),
+    ):
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"{name} must be in [0, 1]")
+    if min_fairness_improvement < 0.0:
+        raise ValueError("min_fairness_improvement must be non-negative")
+
+    source_topk = np.asarray(topk_data["topk_items"], dtype=np.int64)
+    diversity = fairrr_candidate_group_diversity(
+        source_topk,
+        group_matrix,
+        candidate_k=cfg.candidate_k,
+    )
+    candidates = normalize_float_grid(lambda_candidates, default=[cfg.lambda_fair])
+    if float(cfg.lambda_fair) not in candidates:
+        candidates.insert(0, float(cfg.lambda_fair))
+
+    baseline_cfg = FairRerankConfig(**{**cfg.__dict__, "lambda_fair": 0.0})
+    baseline, baseline_metrics = rerank_topk_data(
+        topk_data=topk_data,
+        group_matrix=group_matrix,
+        cfg=baseline_cfg,
+        popularity_penalty=popularity_penalty,
+        ks=ks,
+    )
+    if metric_for_best is None:
+        metric_for_best = f"ndcg@{max(int(k) for k in ks)}"
+    if metric_for_best not in baseline_metrics:
+        raise ValueError(
+            f"validation utility metric {metric_for_best!r} is unavailable; "
+            f"available={sorted(baseline_metrics)}"
+        )
+    baseline_utility = float(baseline_metrics[metric_for_best])
+    baseline_fairness = aggregate_exposure_penalty(
+        baseline["topk_items"],
+        group_matrix,
+        baseline_cfg,
+    )
+    utility_floor = baseline_utility * (1.0 - max_relative_utility_loss)
+
+    trials: List[Dict[str, Any]] = []
+    feasible: List[tuple[float, float, float, FairRerankConfig, Dict[str, Any]]] = []
+    for candidate in candidates:
+        trial_cfg = FairRerankConfig(**{**cfg.__dict__, "lambda_fair": float(candidate)})
+        reranked, metrics = rerank_topk_data(
+            topk_data=topk_data,
+            group_matrix=group_matrix,
+            cfg=trial_cfg,
+            popularity_penalty=popularity_penalty,
+            ks=ks,
+        )
+        change = fairrr_change_summary(
+            source_topk=source_topk,
+            reranked_topk=np.asarray(reranked["topk_items"], dtype=np.int64),
+            top_k=trial_cfg.top_k,
+        )
+        utility = float(metrics[metric_for_best])
+        utility_retention = utility / baseline_utility if baseline_utility > 0.0 else 1.0
+        fairness = aggregate_exposure_penalty(
+            reranked["topk_items"],
+            group_matrix,
+            trial_cfg,
+        )
+        fairness_improvement = baseline_fairness - fairness
+        constraints = {
+            "utility": bool(utility >= utility_floor - 1e-12),
+            "rank_change": bool(
+                change["rank_changed_user_rate"] >= min_rank_changed_user_rate - 1e-12
+            ),
+            "set_change": bool(
+                change["set_changed_user_rate"] >= min_set_changed_user_rate - 1e-12
+            ),
+            "fairness_improvement": bool(
+                fairness_improvement >= min_fairness_improvement - 1e-12
+            ),
+        }
+        trial = {
+            "lambda_fair": float(candidate),
+            **change,
+            "utility_metric": metric_for_best,
+            "utility": utility,
+            "utility_retention": utility_retention,
+            "fairness_penalty": fairness,
+            "fairness_improvement": fairness_improvement,
+            "constraints": constraints,
+            "feasible": bool(all(constraints.values())),
+        }
+        trials.append(trial)
+        if trial["feasible"]:
+            feasible.append((fairness, -utility, float(candidate), trial_cfg, trial))
+
+    constraints_audit = {
+        "utility_metric": metric_for_best,
+        "max_relative_utility_loss": max_relative_utility_loss,
+        "utility_floor": utility_floor,
+        "min_rank_changed_user_rate": min_rank_changed_user_rate,
+        "min_set_changed_user_rate": min_set_changed_user_rate,
+        "min_fairness_improvement": min_fairness_improvement,
+    }
+    if not feasible:
+        return cfg, {
+            "selection_split": "val",
+            "selection_reason": "no_feasible_validation_candidate",
+            "selected_lambda_fair": float(cfg.lambda_fair),
+            "candidate_group_diversity": diversity,
+            "baseline_utility": baseline_utility,
+            "baseline_fairness_penalty": baseline_fairness,
+            "constraints": constraints_audit,
+            "trials": trials,
+        }
+
+    _, _, _, selected_cfg, selected = min(feasible, key=lambda row: row[:3])
+    return selected_cfg, {
+        "selection_split": "val",
+        "selection_reason": "best_validation_fairness_under_constraints",
+        "selected_lambda_fair": float(selected_cfg.lambda_fair),
+        "selected_utility_retention": float(selected["utility_retention"]),
+        "selected_fairness_improvement": float(selected["fairness_improvement"]),
+        "candidate_group_diversity": diversity,
+        "baseline_utility": baseline_utility,
+        "baseline_fairness_penalty": baseline_fairness,
+        "constraints": constraints_audit,
+        "trials": trials,
+    }
 
 def get_dataset_dir(dataset: str, datasets_cfg: Dict[str, Any]) -> Path:
     candidates = []
@@ -370,6 +544,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=None)
 
     parser.add_argument("--popularity_file", type=str, default=None)
+    parser.add_argument(
+        "--require_effective_change",
+        action="store_true",
+        help="Fail formal runs when the candidate pool or validation constraints are invalid.",
+    )
+    parser.add_argument("--max_relative_utility_loss", type=float, default=None)
+    parser.add_argument("--min_rank_changed_user_rate", type=float, default=None)
+    parser.add_argument("--min_set_changed_user_rate", type=float, default=None)
+    parser.add_argument("--min_fairness_improvement", type=float, default=None)
 
     return parser.parse_args()
 
@@ -538,6 +721,12 @@ def main() -> None:
             default=0.2,
         )
     )
+    lambda_fair_candidates = normalize_float_grid(
+        get_nested(file_cfg, ["rerank", "lambda_fair_candidates"]),
+        default=[lambda_fair],
+    )
+    if lambda_fair not in lambda_fair_candidates:
+        lambda_fair_candidates.insert(0, lambda_fair)
 
     lambda_popularity = float(
         first_not_none(
@@ -587,6 +776,38 @@ def main() -> None:
     random_tie_break = bool(
         args.random_tie_break
         or get_nested(file_cfg, ["rerank", "random_tie_break"], default=False)
+    )
+    require_effective_change = bool(
+        args.require_effective_change
+        or get_nested(file_cfg, ["rerank", "require_effective_change"], default=False)
+    )
+    max_relative_utility_loss = float(
+        first_not_none(
+            args.max_relative_utility_loss,
+            get_nested(file_cfg, ["rerank", "max_relative_utility_loss"]),
+            default=0.05,
+        )
+    )
+    min_rank_changed_user_rate = float(
+        first_not_none(
+            args.min_rank_changed_user_rate,
+            get_nested(file_cfg, ["rerank", "min_rank_changed_user_rate"]),
+            default=0.01,
+        )
+    )
+    min_set_changed_user_rate = float(
+        first_not_none(
+            args.min_set_changed_user_rate,
+            get_nested(file_cfg, ["rerank", "min_set_changed_user_rate"]),
+            default=0.01,
+        )
+    )
+    min_fairness_improvement = float(
+        first_not_none(
+            args.min_fairness_improvement,
+            get_nested(file_cfg, ["rerank", "min_fairness_improvement"]),
+            default=1e-6,
+        )
     )
 
     run_id = args.run_id
@@ -649,6 +870,31 @@ def main() -> None:
         seed=int(seed),
     )
 
+    lambda_selection_audit = None
+    if require_effective_change and "val" in splits and len(lambda_fair_candidates) > 1:
+        val_npz = source_run_dir / "topk_val.npz"
+        if val_npz.exists():
+            rerank_cfg, lambda_selection_audit = select_effective_lambda_fair(
+                topk_data=load_npz_topk(val_npz),
+                group_matrix=group_matrix,
+                cfg=rerank_cfg,
+                lambda_candidates=lambda_fair_candidates,
+                popularity_penalty=popularity_penalty,
+                ks=ks,
+                metric_for_best=metric_for_best,
+                max_relative_utility_loss=max_relative_utility_loss,
+                min_rank_changed_user_rate=min_rank_changed_user_rate,
+                min_set_changed_user_rate=min_set_changed_user_rate,
+                min_fairness_improvement=min_fairness_improvement,
+            )
+        else:
+            lambda_selection_audit = {
+                "selection_split": "val",
+                "selection_reason": "missing_validation_topk",
+                "selected_lambda_fair": float(rerank_cfg.lambda_fair),
+                "trials": [],
+            }
+
     resolved = {
         "config": str(cfg_path) if cfg_path is not None else None,
         "dataset": dataset,
@@ -664,6 +910,8 @@ def main() -> None:
         "ks": ks,
         "metric_for_best": metric_for_best,
         "rerank_config": rerank_cfg.__dict__,
+        "lambda_fair_candidates": [float(value) for value in lambda_fair_candidates],
+        "lambda_selection_audit": lambda_selection_audit,
         "requested_groups": requested_groups if isinstance(requested_groups, str) else list(requested_groups),
         "used_groups": list(used_groups),
         "selected_group_columns": selected_cols,
@@ -675,10 +923,26 @@ def main() -> None:
         "group_matrix_file": group_matrix_file,
         "group_metadata": str(group_metadata) if group_metadata is not None else None,
         "popularity_file": popularity_file,
+        "require_effective_change": require_effective_change,
+        "fairrr_selection_constraints": {
+            "max_relative_utility_loss": max_relative_utility_loss,
+            "min_rank_changed_user_rate": min_rank_changed_user_rate,
+            "min_set_changed_user_rate": min_set_changed_user_rate,
+            "min_fairness_improvement": min_fairness_improvement,
+        },
     }
 
     save_json(resolved, output_dir / "config_resolved.json")
 
+    if require_effective_change and lambda_selection_audit is not None:
+        reason = lambda_selection_audit.get("selection_reason")
+        if reason in {"no_feasible_validation_candidate", "missing_validation_topk"}:
+            diversity = lambda_selection_audit.get("candidate_group_diversity", {})
+            raise ValueError(
+                "FairRR validation-only lambda selection failed: "
+                f"reason={reason}, constraints={lambda_selection_audit.get('constraints')}, "
+                f"candidate_group_audit={diversity}. Inspect config_resolved.json."
+            )
     print("========== FairRerank ==========")
     print(f"config:         {cfg_path}")
     print(f"dataset:        {dataset}")
@@ -726,8 +990,16 @@ def main() -> None:
         "candidate_k": int(rerank_cfg.candidate_k),
         "lambda_fair": float(rerank_cfg.lambda_fair),
         "lambda_popularity": float(rerank_cfg.lambda_popularity),
+        "lambda_fair_candidates": [float(value) for value in lambda_fair_candidates],
+        "lambda_selection_audit": lambda_selection_audit,
         "used_groups": list(used_groups),
         "selected_group_columns": selected_cols,
+        "fairrr_selection_constraints": {
+            "max_relative_utility_loss": max_relative_utility_loss,
+            "min_rank_changed_user_rate": min_rank_changed_user_rate,
+            "min_set_changed_user_rate": min_set_changed_user_rate,
+            "min_fairness_improvement": min_fairness_improvement,
+        },
     }
 
     for sp in splits:
@@ -751,13 +1023,38 @@ def main() -> None:
         )
         elapsed = time.time() - start
 
+        with np.load(input_npz, allow_pickle=False) as source_archive:
+            source_topk = np.asarray(source_archive["topk_items"], dtype=np.int64)
+        with np.load(output_npz, allow_pickle=False) as reranked_archive:
+            reranked_topk = np.asarray(reranked_archive["topk_items"], dtype=np.int64)
+        pool_audit = candidate_pool_audit(
+            source_width=source_topk.shape[1],
+            candidate_k=rerank_cfg.candidate_k,
+            top_k=rerank_cfg.top_k,
+        )
+        change_audit = fairrr_change_summary(
+            source_topk=source_topk,
+            reranked_topk=reranked_topk,
+            top_k=rerank_cfg.top_k,
+        )
+        if require_effective_change:
+            validate_formal_fairrr(
+                change_audit,
+                pool_audit,
+                min_rank_changed_user_rate=min_rank_changed_user_rate,
+                min_set_changed_user_rate=min_set_changed_user_rate,
+            )
+
         summary[sp] = metrics
+        summary[f"{sp}_candidate_pool_audit"] = pool_audit
+        summary[f"{sp}_change_audit"] = change_audit
         summary[f"{sp}_topk_path"] = str(output_npz)
         summary[f"{sp}_elapsed_sec"] = float(elapsed)
 
         print(f"[{sp}] saved: {output_npz}")
         print(json.dumps(metrics, indent=2, ensure_ascii=False, default=json_default))
         print(f"[{sp}] elapsed: {elapsed:.2f}s")
+        print(f"[{sp}] change audit: {json.dumps(change_audit, ensure_ascii=False)}")
 
     if "val" in summary and isinstance(summary["val"], dict) and metric_for_best in summary["val"]:
         best_metric = float(summary["val"][metric_for_best])  # type: ignore[index]

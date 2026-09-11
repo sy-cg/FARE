@@ -67,11 +67,17 @@ except ImportError as exc:  # pragma: no cover
 
 try:
     from model_fare import FARE  # type: ignore
+    from exposure_prior import (  # type: ignore
+        build_exposure_class_weights,
+        resolve_exposure_item_prior,
+    )
 except ImportError as exc:  # pragma: no cover
     raise ImportError(
-        "Could not import FARE from src/model_fare.py. "
-        "Please make sure src/model_fare.py exists and passes py_compile."
+        "Could not import FARE or exposure-prior helpers. Please make sure "
+        "src/model_fare.py and src/exposure_prior.py exist and pass py_compile."
     ) from exc
+
+from revision_diagnostics import validate_backbone_checkpoint_load  # type: ignore
 
 
 CORE_GROUPS = [
@@ -119,6 +125,7 @@ def parse_args(default_config: str = "configs/fare_3090.yaml") -> argparse.Names
     parser.add_argument("--config", type=str, default=default_config)
     parser.add_argument("--dataset", type=str, default=None)
     parser.add_argument("--run_id", type=str, default=None)
+    parser.add_argument("--seed", type=int, default=None)
     parser.add_argument(
         "--method_name",
         type=str,
@@ -140,7 +147,13 @@ def parse_args(default_config: str = "configs/fare_3090.yaml") -> argparse.Names
         default=None,
         help="Backward-compatible alias of --init_backbone_checkpoint",
     )
-    parser.add_argument("--freeze_id_backbone", action="store_true")
+    backbone_mode = parser.add_mutually_exclusive_group()
+    backbone_mode.add_argument("--freeze_id_backbone", action="store_true")
+    backbone_mode.add_argument(
+        "--train_id_backbone",
+        action="store_true",
+        help="Train the ID branch; used by the residual-off exposure-reweight control.",
+    )
 
     # Model overrides.
     parser.add_argument("--epochs", type=int, default=None)
@@ -212,6 +225,22 @@ def parse_args(default_config: str = "configs/fare_3090.yaml") -> argparse.Names
         help="Path to a top-k .npz file used to estimate exposure distribution.",
     )
     parser.add_argument(
+        "--fair_rec_exposure_source",
+        type=str,
+        default=None,
+        choices=["reference_topk", "train_popularity", "platform_views", "item_prior"],
+        help=(
+            "Exposure source: validation reference Top-K, train interactions, "
+            "platform views, or an explicit item prior."
+        ),
+    )
+    parser.add_argument(
+        "--fair_rec_exposure_item_weights_path",
+        type=str,
+        default=None,
+        help="Optional .npy item-prior path for independent exposure controls.",
+    )
+    parser.add_argument(
         "--fair_rec_exposure_target",
         type=str,
         default=None,
@@ -235,6 +264,7 @@ def parse_args(default_config: str = "configs/fare_3090.yaml") -> argparse.Names
     parser.add_argument("--eval_every", type=int, default=None)
     parser.add_argument("--num_workers", type=int, default=None)
     parser.add_argument("--no_fairness_eval", action="store_true")
+    parser.add_argument("--skip_test_after_training", action="store_true")
     parser.add_argument("--cpu", action="store_true")
 
     return parser.parse_args()
@@ -249,6 +279,9 @@ def apply_overrides(
     cfg.setdefault("train", {})
     cfg.setdefault("eval", {})
     cfg.setdefault("fare", {})
+
+    if args.seed is not None:
+        cfg["seed"] = int(args.seed)
 
     if args.backbone is not None:
         cfg["model"]["backbone"] = args.backbone
@@ -307,6 +340,10 @@ def apply_overrides(
 
     if args.fair_rec_exposure_topk_path is not None:
         cfg["fare"]["fair_rec_exposure_topk_path"] = args.fair_rec_exposure_topk_path
+    if args.fair_rec_exposure_source is not None:
+        cfg["fare"]["fair_rec_exposure_source"] = args.fair_rec_exposure_source
+    if args.fair_rec_exposure_item_weights_path is not None:
+        cfg["fare"]["fair_rec_exposure_item_weights_path"] = args.fair_rec_exposure_item_weights_path
     if args.fair_rec_exposure_target is not None:
         cfg["fare"]["fair_rec_exposure_target"] = args.fair_rec_exposure_target
     if args.allow_test_exposure_topk:
@@ -316,9 +353,15 @@ def apply_overrides(
         cfg["fare"]["min_group_count"] = args.min_group_count
     if args.drop_rare_classes:
         cfg["fare"]["drop_rare_classes"] = True
+    if args.freeze_id_backbone:
+        cfg["fare"]["freeze_id_backbone"] = True
+    if args.train_id_backbone:
+        cfg["fare"]["freeze_id_backbone"] = False
 
     if args.no_fairness_eval:
         cfg["eval"]["run_fairness_eval"] = False
+    if args.skip_test_after_training:
+        cfg["eval"]["run_test_after_training"] = False
     if args.cpu:
         cfg["device"] = "cpu"
 
@@ -748,9 +791,13 @@ def build_fare_model(
     return FARE(**valid_kwargs)
 
 
-def load_initial_backbone(model: FARE, checkpoint_path: Optional[str], device: torch.device) -> None:
+def load_initial_backbone(
+    model: FARE,
+    checkpoint_path: Optional[str],
+    device: torch.device,
+) -> Optional[Dict[str, Any]]:
     if not checkpoint_path:
-        return
+        return None
 
     path = resolve_path(checkpoint_path)
     if not path.exists():
@@ -764,9 +811,17 @@ def load_initial_backbone(model: FARE, checkpoint_path: Optional[str], device: t
     else:
         missing, unexpected = model.load_state_dict(state, strict=False)
 
+    validate_backbone_checkpoint_load(missing, unexpected, str(path))
+
     print(f"Loaded backbone checkpoint: {path}")
     print(f"  missing keys: {len(missing)}")
     print(f"  unexpected keys: {len(unexpected)}")
+    return {
+        "checkpoint": str(path),
+        "complete": True,
+        "missing_keys": list(missing),
+        "unexpected_keys": list(unexpected),
+    }
 
 
 def freeze_id_backbone(model: torch.nn.Module) -> None:
@@ -836,6 +891,7 @@ def build_exposure_aware_class_weights(
     label_tensors: Dict[str, torch.Tensor],
     fair_cfg: Dict[str, Any],
     device: torch.device,
+    data_dir: Path,
 ) -> Dict[str, torch.Tensor]:
     """Build group-level class weights from top-K exposure imbalance.
 
@@ -863,22 +919,38 @@ def build_exposure_aware_class_weights(
     if mode != "exposure" or gamma <= 0:
         return {}
 
-    topk_path = fair_cfg.get("fair_rec_exposure_topk_path", None)
-    if not topk_path:
-        raise ValueError(
-            "FARE exposure reweighting requires --fair_rec_exposure_topk_path "
-            "or fare.fair_rec_exposure_topk_path in the config."
-        )
+    exposure_source = str(
+        fair_cfg.get("fair_rec_exposure_source", "reference_topk")
+    ).strip().lower()
+    topk_path_resolved: Optional[Path] = None
+    topk_items_np: Optional[np.ndarray] = None
+    item_prior_np: Optional[np.ndarray] = None
 
-    topk_path_resolved = resolve_path(str(topk_path))
-    if (
-        "test" in topk_path_resolved.name.lower()
-        and not bool(fair_cfg.get("allow_test_exposure_topk", False))
-    ):
-        raise ValueError(
-            f"Refusing to use test-split exposure file for training: {topk_path_resolved}. "
-            "Use a validation/train exposure file, or pass --allow_test_exposure_topk only for diagnostics."
+    if exposure_source == "reference_topk":
+        topk_path = fair_cfg.get("fair_rec_exposure_topk_path", None)
+        if not topk_path:
+            raise ValueError(
+                "FARE reference_topk exposure requires --fair_rec_exposure_topk_path "
+                "or fare.fair_rec_exposure_topk_path in the config."
+            )
+        topk_path_resolved = resolve_path(str(topk_path))
+        if (
+            "test" in topk_path_resolved.name.lower()
+            and not bool(fair_cfg.get("allow_test_exposure_topk", False))
+        ):
+            raise ValueError(
+                f"Refusing to use test-split exposure file for training: {topk_path_resolved}. "
+                "Use a validation/train exposure file, or pass --allow_test_exposure_topk only for diagnostics."
+            )
+        topk_items_np = load_topk_items_from_npz(str(topk_path_resolved))
+    elif exposure_source in {"train_popularity", "platform_views", "item_prior"}:
+        item_prior_np = resolve_exposure_item_prior(
+            data_dir=data_dir,
+            source=exposure_source,
+            explicit_path=fair_cfg.get("fair_rec_exposure_item_weights_path", None),
         )
+    else:
+        raise ValueError(f"Unsupported fair_rec_exposure_source={exposure_source!r}")
 
     groups = _normalize_group_list(
         fair_cfg.get("fair_rec_reweight_groups", None),
@@ -894,18 +966,14 @@ def build_exposure_aware_class_weights(
     if w_max < w_min:
         w_min, w_max = w_max, w_min
 
-    topk_items_np = load_topk_items_from_npz(str(topk_path))
-    if topk_items_np.ndim != 2:
-        raise ValueError(f"Expected a 2-D top-k array, got shape={topk_items_np.shape}")
-
-    if exposure_k > 0:
-        topk_items_np = topk_items_np[:, : min(exposure_k, topk_items_np.shape[1])]
-
-    topk_items_cpu = torch.as_tensor(topk_items_np.reshape(-1), dtype=torch.long)
     exposure_weights: Dict[str, torch.Tensor] = {}
 
+    print(f"[EXPOSURE] source={exposure_source}")
     print(f"[EXPOSURE] topk_path={topk_path_resolved}")
-    print(f"[EXPOSURE] topk_shape={tuple(topk_items_np.shape)} exposure_k={exposure_k}")
+    if topk_items_np is not None:
+        print(f"[EXPOSURE] topk_shape={tuple(topk_items_np.shape)} exposure_k={exposure_k}")
+    if item_prior_np is not None:
+        print(f"[EXPOSURE] item_prior_shape={tuple(item_prior_np.shape)}")
     print(f"[EXPOSURE] groups={groups} target={target_type} gamma={gamma}")
     print(f"[EXPOSURE] clip=[{w_min}, {w_max}]")
 
@@ -919,66 +987,34 @@ def build_exposure_aware_class_weights(
             print(f"[EXPOSURE][WARN] group={group} has empty item labels; skip.")
             continue
 
-        max_item_id = labels_all.numel() - 1
-        valid_topk_mask = (topk_items_cpu > 0) & (topk_items_cpu <= max_item_id)
-        invalid_count = int((~valid_topk_mask).sum().item())
-        if invalid_count:
-            print(f"[EXPOSURE][WARN] group={group} ignored {invalid_count} invalid/padding item ids.")
-        safe_topk = topk_items_cpu[valid_topk_mask]
-        if safe_topk.numel() == 0:
-            print(f"[EXPOSURE][WARN] group={group} has no valid exposure item ids; skip.")
+        try:
+            result = build_exposure_class_weights(
+                labels=labels_all.numpy(),
+                gamma=gamma,
+                target_type=target_type,
+                source=exposure_source,
+                topk_items=topk_items_np,
+                item_prior=item_prior_np,
+                exposure_k=exposure_k,
+                min_weight=w_min,
+                max_weight=w_max,
+            )
+        except ValueError as exc:
+            print(f"[EXPOSURE][WARN] group={group} skipped: {exc}")
             continue
 
-        exposed_labels = labels_all[safe_topk]
-        exposed_labels = exposed_labels[exposed_labels >= 0]
-
-        catalog_labels = labels_all[1:]  # item 0 is padding.
-        catalog_labels = catalog_labels[catalog_labels >= 0]
-
-        if exposed_labels.numel() == 0 or catalog_labels.numel() == 0:
-            print(f"[EXPOSURE][WARN] group={group} has no valid catalog/exposure labels; skip.")
-            continue
-
-        num_classes = int(max(catalog_labels.max().item(), exposed_labels.max().item())) + 1
-        catalog_counts = torch.bincount(catalog_labels, minlength=num_classes).float()
-        exposure_counts = torch.bincount(exposed_labels, minlength=num_classes).float()
-        valid = catalog_counts > 0
-
-        if int(valid.sum().item()) <= 1:
-            print(f"[EXPOSURE][WARN] group={group} has <=1 valid class; skip.")
-            continue
-
-        if target_type == "uniform":
-            q = torch.zeros_like(catalog_counts)
-            q[valid] = 1.0 / valid.sum().clamp_min(1)
-        else:
-            q = catalog_counts / catalog_counts.sum().clamp_min(1.0)
-
-        e = exposure_counts / exposure_counts.sum().clamp_min(1.0)
-
-        eps = 1e-8
-        imbalance = torch.zeros_like(q)
-        imbalance[valid] = (q[valid] - e[valid]) / q[valid].clamp_min(eps)
-
-        raw_w = torch.ones_like(q)
-        raw_w[valid] = 1.0 + gamma * imbalance[valid]
-        raw_w = raw_w.clamp(min=w_min, max=w_max)
-
-        # Keep the global scale stable.
-        raw_w[valid] = raw_w[valid] / raw_w[valid].mean().clamp_min(1e-8)
-        raw_w = torch.nan_to_num(raw_w, nan=1.0, posinf=w_max, neginf=w_min)
-
-        exposure_weights[group] = raw_w.to(device=device, dtype=torch.float32)
+        raw_w = torch.as_tensor(result.class_weights, dtype=torch.float32, device=device)
+        exposure_weights[group] = raw_w
 
         print(f"[EXPOSURE] group={group}")
-        print(f"  catalog_counts={catalog_counts.tolist()}")
-        print(f"  exposure_counts={exposure_counts.tolist()}")
-        print(f"  target_dist={q.tolist()}")
-        print(f"  exposure_dist={e.tolist()}")
+        print(f"  catalog_counts={result.catalog_counts.tolist()}")
+        print(f"  exposure_counts={result.exposure_counts.tolist()}")
+        print(f"  target_dist={result.target_distribution.tolist()}")
+        print(f"  exposure_dist={result.exposure_distribution.tolist()}")
         print(f"  class_weights={raw_w.tolist()}")
         print(
-            f"  weight_min={raw_w[valid].min().item():.4f} "
-            f"weight_max={raw_w[valid].max().item():.4f}"
+            f"  weight_min={raw_w.min().item():.4f} "
+            f"weight_max={raw_w.max().item():.4f}"
         )
 
     if not exposure_weights:
@@ -1336,6 +1372,7 @@ def main(
     train_cfg = cfg.get("train", {})
     eval_cfg = cfg.get("eval", {})
     fair_cfg = cfg.get("fare", {})
+    run_test_after_training = bool(eval_cfg.get("run_test_after_training", True))
 
     method_name = args.method_name or str(cfg.get("method_name", default_method_name))
 
@@ -1352,7 +1389,7 @@ def main(
 
     train_rows = read_user_sequences(data_dir / "train.txt")
     val_rows = read_user_sequences(data_dir / "val.txt")
-    test_rows = read_user_sequences(data_dir / "test.txt")
+    test_rows = read_user_sequences(data_dir / "test.txt") if run_test_after_training else []
     num_items = infer_num_items(data_dir)
 
     requested_groups = fair_cfg.get("groups") or FULL_GROUPS
@@ -1370,7 +1407,8 @@ def main(
 
     train_ds = NextItemTrainDataset(train_rows, max_seq_len=max_seq_len)
     val_ds = EvalNextItemDataset(val_rows, max_seq_len=max_seq_len)
-    test_ds = EvalNextItemDataset(test_rows, max_seq_len=max_seq_len)
+    test_ds = EvalNextItemDataset(test_rows, max_seq_len=max_seq_len) if run_test_after_training else None
+    test_count = len(test_ds) if test_ds is not None else 0
     collate_fn = make_collate_fn(max_seq_len)
 
     train_loader = torch.utils.data.DataLoader(
@@ -1391,15 +1429,17 @@ def main(
         collate_fn=collate_fn,
         drop_last=False,
     )
-    test_loader = torch.utils.data.DataLoader(
-        test_ds,
-        batch_size=eval_batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        collate_fn=collate_fn,
-        drop_last=False,
-    )
+    test_loader = None
+    if test_ds is not None:
+        test_loader = torch.utils.data.DataLoader(
+            test_ds,
+            batch_size=eval_batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            collate_fn=collate_fn,
+            drop_last=False,
+        )
 
     seen_train = build_seen_items(train_rows)
 
@@ -1411,7 +1451,7 @@ def main(
     ).to(device)
 
     init_ckpt = args.init_backbone_checkpoint or args.init_sasrec_checkpoint or cfg.get("init_backbone_checkpoint")
-    load_initial_backbone(model, init_ckpt, device=device)
+    backbone_checkpoint_audit = load_initial_backbone(model, init_ckpt, device=device)
 
     if bool(args.freeze_id_backbone or fair_cfg.get("freeze_id_backbone", False)):
         freeze_id_backbone(model)
@@ -1434,12 +1474,13 @@ def main(
             "num_items": int(num_items),
             "num_train_samples": int(len(train_ds)),
             "num_val_samples": int(len(val_ds)),
-            "num_test_samples": int(len(test_ds)),
+            "num_test_samples": int(test_count),
             "method": method_name,
             "model_name": run_name,
             "run_id": run_id,
             "backbone": backbone,
             "init_backbone_checkpoint": str(init_ckpt) if init_ckpt else None,
+            "backbone_checkpoint_audit": backbone_checkpoint_audit,
             "device_resolved": str(device),
             "fairness_groups_used": list(group_labels.keys()),
             "group_num_classes": group_num_classes,
@@ -1458,7 +1499,7 @@ def main(
     print(f"num_items:     {num_items}")
     print(f"train samples: {len(train_ds)}")
     print(f"val samples:   {len(val_ds)}")
-    print(f"test samples:  {len(test_ds)}")
+    print(f"test samples:  {test_count}")
     print(f"groups:        {list(group_labels.keys())}")
     print(f"group classes: {group_num_classes}")
     print(f"parameters:    {sum(p.numel() for p in model.parameters()):,}")
@@ -1469,6 +1510,8 @@ def main(
     print(f"rec_rw_mode:   {fair_cfg.get('fair_rec_reweight_mode', 'exposure')}")
     print(f"rec_rw_groups: {fair_cfg.get('fair_rec_reweight_groups', None)}")
     print(f"exp_topk_path: {fair_cfg.get('fair_rec_exposure_topk_path', None)}")
+    print(f"exp_source:    {fair_cfg.get('fair_rec_exposure_source', 'reference_topk')}")
+    print(f"exp_prior:     {fair_cfg.get('fair_rec_exposure_item_weights_path', None)}")
     print(f"exp_target:    {fair_cfg.get('fair_rec_exposure_target', 'catalog')}")
     print(f"exp_k:         {int(fair_cfg.get('fair_rec_exposure_k', 10))}")
 
@@ -1482,16 +1525,21 @@ def main(
     mask_seen_items = bool(eval_cfg.get("mask_seen_items", True))
     save_topk_npz = bool(eval_cfg.get("save_topk_npz", True))
 
+    exposure_weight_start = time.perf_counter()
     exposure_class_weights = build_exposure_aware_class_weights(
         label_tensors=group_labels,
         fair_cfg=fair_cfg,
         device=device,
+        data_dir=data_dir,
     )
+    exposure_weight_build_sec = time.perf_counter() - exposure_weight_start
 
     best_metric = -float("inf")
     best_epoch = 0
     bad_epochs = 0
     logs: List[Dict[str, float]] = []
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
 
     for epoch in range(1, epochs + 1):
         start = time.time()
@@ -1600,10 +1648,11 @@ def main(
         "num_items": int(num_items),
         "num_train_samples": int(len(train_ds)),
         "num_val_samples": int(len(val_ds)),
-        "num_test_samples": int(len(test_ds)),
+        "num_test_samples": int(test_count),
         "fairness_groups_used": list(group_labels.keys()),
         "group_num_classes": group_num_classes,
         "init_backbone_checkpoint": str(init_ckpt) if init_ckpt else None,
+        "backbone_checkpoint_audit": backbone_checkpoint_audit,
         "fair_weight_init": float(fair_cfg.get("fair_weight_init", 0.01)),
         "max_fair_weight": float(fair_cfg.get("max_fair_weight", 0.1)),
         "residual_score_weight": float(fair_cfg.get("residual_score_weight", 1.0)),
@@ -1613,24 +1662,58 @@ def main(
         "fair_rec_reweight_min": float(fair_cfg.get("fair_rec_reweight_min", 0.5)),
         "fair_rec_reweight_max": float(fair_cfg.get("fair_rec_reweight_max", 2.0)),
         "fair_rec_exposure_topk_path": fair_cfg.get("fair_rec_exposure_topk_path", None),
+        "fair_rec_exposure_source": str(fair_cfg.get("fair_rec_exposure_source", "reference_topk")),
+        "fair_rec_exposure_item_weights_path": fair_cfg.get("fair_rec_exposure_item_weights_path", None),
         "fair_rec_exposure_target": str(fair_cfg.get("fair_rec_exposure_target", "catalog")),
         "fair_rec_exposure_k": int(fair_cfg.get("fair_rec_exposure_k", 10)),
+        "efficiency": {
+            "total_parameters": int(sum(p.numel() for p in model.parameters())),
+            "trainable_parameters": int(sum(p.numel() for p in model.parameters() if p.requires_grad)),
+            "mean_epoch_sec": float(np.mean([row["epoch_time_sec"] for row in logs])),
+            "total_train_sec": float(sum(row["epoch_time_sec"] for row in logs)),
+            "exposure_weight_build_sec": float(exposure_weight_build_sec),
+            "peak_cuda_memory_mb": (
+                float(torch.cuda.max_memory_allocated(device) / (1024**2)) if device.type == "cuda" else 0.0
+            ),
+            "torch_version": str(torch.__version__),
+            "cuda_version": str(torch.version.cuda),
+            "gpu_name": torch.cuda.get_device_name(device) if device.type == "cuda" else "cpu",
+        },
     }
 
-    if bool(eval_cfg.get("run_test_after_training", True)):
-        val_topk_path = run_dir / "topk_val.npz" if save_topk_npz else None
-        test_topk_path = run_dir / "topk_test.npz" if save_topk_npz else None
+    # Validation artifacts are always produced because configuration and policy
+    # selection are validation-only. Test evaluation remains an explicit,
+    # optional final step for the frozen selected configuration.
+    val_topk_path = run_dir / "topk_val.npz" if save_topk_npz else None
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    val_start = time.perf_counter()
+    summary["val"] = evaluate_full_sort(
+        model=model,
+        loader=val_loader,
+        device=device,
+        ks=ks,
+        num_items=num_items,
+        mask_seen_items=mask_seen_items,
+        seen_items=seen_train,
+        save_topk_path=val_topk_path,
+    )
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    val_inference_sec = time.perf_counter() - val_start
+    summary["efficiency"].update(
+        {
+            "val_inference_sec": float(val_inference_sec),
+            "val_user_count": int(len(val_ds)),
+            "val_ms_per_user": float(1000.0 * val_inference_sec / max(len(val_ds), 1)),
+            "val_users_per_sec": float(len(val_ds) / max(val_inference_sec, 1.0e-12)),
+        }
+    )
 
-        summary["val"] = evaluate_full_sort(
-            model=model,
-            loader=val_loader,
-            device=device,
-            ks=ks,
-            num_items=num_items,
-            mask_seen_items=mask_seen_items,
-            seen_items=seen_train,
-            save_topk_path=val_topk_path,
-        )
+    if bool(eval_cfg.get("run_test_after_training", True)):
+        assert test_loader is not None and test_ds is not None
+        test_topk_path = run_dir / "topk_test.npz" if save_topk_npz else None
+        test_start = time.perf_counter()
         summary["test"] = evaluate_full_sort(
             model=model,
             loader=test_loader,
@@ -1641,10 +1724,28 @@ def main(
             seen_items=seen_train,
             save_topk_path=test_topk_path,
         )
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        test_inference_sec = time.perf_counter() - test_start
+        summary["efficiency"].update(
+            {
+                "test_inference_sec": float(test_inference_sec),
+                "test_user_count": int(len(test_ds)),
+                "test_ms_per_user": float(1000.0 * test_inference_sec / max(len(test_ds), 1)),
+                "test_users_per_sec": float(len(test_ds) / max(test_inference_sec, 1.0e-12)),
+                "peak_cuda_memory_mb": (
+                    float(torch.cuda.max_memory_allocated(device) / (1024**2))
+                    if device.type == "cuda"
+                    else 0.0
+                ),
+            }
+        )
 
     if bool(eval_cfg.get("run_fairness_eval", False)):
-        if save_topk_npz and bool(eval_cfg.get("run_test_after_training", True)):
-            fairness_splits = ["val", "test"]
+        if save_topk_npz:
+            fairness_splits = ["val"]
+            if run_test_after_training:
+                fairness_splits.append("test")
             fairness_result = run_saved_topk_fairness_eval(
                 data_dir=data_dir,
                 run_dir=run_dir,
@@ -1659,7 +1760,7 @@ def main(
         else:
             summary["fairness_eval"] = {
                 "status": "skipped",
-                "message": "Fairness evaluation requires run_test_after_training=true and save_topk_npz=true.",
+                "message": "Fairness evaluation requires save_topk_npz=true.",
             }
 
     save_json(summary, run_dir / "metrics_summary.json")

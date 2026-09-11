@@ -73,6 +73,7 @@ MULTIMODAL_METHOD_MAP = {
     "bm3": "BM3",
     "freedom": "FREEDOM",
     "lattice": "LATTICE",
+    "findrec": "FindRec",
 }
 
 METHOD_NAME_MAP = {
@@ -98,6 +99,7 @@ METHOD_NAME_MAP = {
     "bm3": "BM3",
     "freedom": "FREEDOM",
     "lattice": "LATTICE",
+    "findrec": "FindRec",
     # FARE final model
     "fare": "FARE",
 }
@@ -122,6 +124,7 @@ DISPLAY_METHODS = {
     "BM3",
     "FREEDOM",
     "LATTICE",
+    "FindRec",
 
     # Fairness baselines
     "Adv-SASRec",
@@ -236,6 +239,8 @@ def _infer_base_model(row) -> str:
 
     if "lattice" in text:
         return "LATTICE"
+    if "findrec" in text:
+        return "FindRec"
     if "freedom" in text:
         return "FREEDOM"
     if "bm3" in text:
@@ -422,6 +427,7 @@ METHOD_ORDER = {
     "BM3": 31,
     "FREEDOM": 32,
     "LATTICE": 33,
+    "FindRec": 34,
 
     "Adv-SASRec": 50,
     "Adv-GRU4Rec": 51,

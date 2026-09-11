@@ -8,13 +8,14 @@
 #   - BM3
 #   - FREEDOM
 #   - LATTICE
+#   - FindRec
 #
 # Usage:
 #   bash scripts/run_all_multimodal_baselines.sh
 #
 # Useful overrides:
 #   DATASETS="Video_Games Musical_Instruments Baby_Products" bash scripts/run_all_multimodal_baselines.sh
-#   MODELS="vbpr bm3 freedom lattice" bash scripts/run_all_multimodal_baselines.sh
+#   MODELS="vbpr bm3 freedom lattice findrec" bash scripts/run_all_multimodal_baselines.sh
 #   RUN_TAG=main_20260519 bash scripts/run_all_multimodal_baselines.sh
 #   SMOKE=1 bash scripts/run_all_multimodal_baselines.sh
 #   DRY_RUN=1 bash scripts/run_all_multimodal_baselines.sh
@@ -25,7 +26,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 DATASETS_STR="${DATASETS:-Video_Games Musical_Instruments Baby_Products}"
-MODELS_STR="${MODELS:-vbpr bm3 freedom lattice}"
+MODELS_STR="${MODELS:-vbpr bm3 freedom lattice findrec}"
 RESULT_ROOT="${RESULT_ROOT:-results}"
 RUN_TAG="${RUN_TAG:-$(date +%Y%m%d_%H%M%S)}"
 DRY_RUN="${DRY_RUN:-0}"
@@ -41,6 +42,7 @@ script_for_model() {
     bm3) echo "scripts/run_bm3.py" ;;
     freedom) echo "scripts/run_freedom.py" ;;
     lattice) echo "scripts/run_lattice.py" ;;
+    findrec) echo "scripts/run_findrec.py" ;;
     *) echo "scripts/run_${1}.py" ;;
   esac
 }
@@ -51,6 +53,7 @@ config_for_model() {
     bm3) echo "configs/bm3_3090.yaml" ;;
     freedom) echo "configs/freedom_3090.yaml" ;;
     lattice) echo "configs/lattice_3090.yaml" ;;
+    findrec) echo "configs/findrec_3090.yaml" ;;
     *) echo "configs/${1}_3090.yaml" ;;
   esac
 }

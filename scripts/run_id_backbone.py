@@ -81,10 +81,12 @@ try:
     from model_gru4rec import GRU4RecID  # type: ignore
     from model_bert4rec import BERT4RecID  # type: ignore
     from io_utils import safe_torch_load  # type: ignore
+    from eval_protocol import evaluation_history_items  # type: ignore
 except ImportError as exc:  # pragma: no cover
     raise ImportError(
-        "Could not import backbone models. Make sure src/model_sasrec.py, "
-        "src/model_gru4rec.py, src/model_bert4rec.py, and src/io_utils.py exist."
+        "Could not import backbone models or evaluation helpers. Make sure "
+        "src/model_sasrec.py, src/model_gru4rec.py, src/model_bert4rec.py, "
+        "src/io_utils.py, and src/eval_protocol.py exist."
     ) from exc
 
 
@@ -361,18 +363,28 @@ def evaluate_full_sort(
         scores = model.full_sort_scores(user_ids, sequences, lengths)
         scores[:, 0] = -1e30
 
-        if mask_seen_items and seen_items is not None:
-            # Mask historical items except the ground-truth target.
+        if mask_seen_items:
+            # Mask the actual per-example prefix plus any supplied older
+            # history. Test prefixes include the validation interaction, so
+            # using train-only history here would produce protocol leakage.
             scores = scores.clone()
             user_cpu = user_ids.detach().cpu().tolist()
             target_cpu = targets.detach().cpu().tolist()
-            for row_idx, (u, tgt) in enumerate(zip(user_cpu, target_cpu)):
-                seen = seen_items.get(int(u), None)
-                if not seen:
-                    continue
-                for item in seen:
-                    if item != int(tgt) and 0 <= item <= num_items:
-                        scores[row_idx, item] = -1e30
+            sequence_cpu = sequences.detach().cpu().tolist()
+            length_cpu = lengths.detach().cpu().tolist()
+            for row_idx, (u, tgt, seq, length) in enumerate(
+                zip(user_cpu, target_cpu, sequence_cpu, length_cpu)
+            ):
+                prefix = seq[: max(int(length), 0)]
+                history = evaluation_history_items(
+                    user_id=int(u),
+                    prefix=prefix,
+                    target=int(tgt),
+                    seen_items=seen_items,
+                    num_items=num_items,
+                )
+                for item in history:
+                    scores[row_idx, item] = -1e30
 
         target_scores = scores.gather(1, targets.view(-1, 1))
         # Rank is 1 + number of candidates with strictly larger score.
@@ -531,6 +543,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--dataset", type=str, default=None)
     parser.add_argument("--run_id", type=str, default=None)
+    parser.add_argument("--seed", type=int, default=None)
 
     # Common overrides.
     parser.add_argument("--epochs", type=int, default=None)
@@ -555,6 +568,9 @@ def apply_overrides(cfg: Dict, args: argparse.Namespace) -> Dict:
     cfg.setdefault("model", {})
     cfg.setdefault("train", {})
     cfg.setdefault("eval", {})
+
+    if args.seed is not None:
+        cfg["seed"] = int(args.seed)
 
     if args.epochs is not None:
         cfg["train"]["epochs"] = args.epochs
@@ -714,6 +730,8 @@ def main() -> None:
     best_epoch = 0
     bad_epochs = 0
     logs: List[Dict[str, float]] = []
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
 
     for epoch in range(1, epochs + 1):
         start = time.time()
@@ -809,11 +827,26 @@ def main() -> None:
         "num_train_samples": int(len(train_ds)),
         "num_val_samples": int(len(val_ds)),
         "num_test_samples": int(len(test_ds)),
+        "efficiency": {
+            "total_parameters": int(sum(p.numel() for p in model.parameters())),
+            "trainable_parameters": int(sum(p.numel() for p in model.parameters() if p.requires_grad)),
+            "mean_epoch_sec": float(np.mean([row["epoch_time_sec"] for row in logs])),
+            "total_train_sec": float(sum(row["epoch_time_sec"] for row in logs)),
+            "peak_cuda_memory_mb": (
+                float(torch.cuda.max_memory_allocated(device) / (1024**2)) if device.type == "cuda" else 0.0
+            ),
+            "torch_version": str(torch.__version__),
+            "cuda_version": str(torch.version.cuda),
+            "gpu_name": torch.cuda.get_device_name(device) if device.type == "cuda" else "cpu",
+        },
     }
 
     if bool(eval_cfg.get("run_test_after_training", True)):
         val_topk_path = run_dir / "topk_val.npz" if save_topk_npz else None
         test_topk_path = run_dir / "topk_test.npz" if save_topk_npz else None
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        val_start = time.perf_counter()
         val_final = evaluate_full_sort(
             model=model,
             loader=val_loader,
@@ -824,6 +857,10 @@ def main() -> None:
             seen_items=seen_train,
             save_topk_path=val_topk_path,
         )
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        val_inference_sec = time.perf_counter() - val_start
+        test_start = time.perf_counter()
         test_final = evaluate_full_sort(
             model=model,
             loader=test_loader,
@@ -834,8 +871,29 @@ def main() -> None:
             seen_items=seen_train,
             save_topk_path=test_topk_path,
         )
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        test_inference_sec = time.perf_counter() - test_start
         summary["val"] = val_final
         summary["test"] = test_final
+        efficiency = summary["efficiency"]
+        assert isinstance(efficiency, dict)
+        efficiency.update(
+            {
+                "val_inference_sec": float(val_inference_sec),
+                "val_user_count": int(len(val_ds)),
+                "val_ms_per_user": float(1000.0 * val_inference_sec / max(len(val_ds), 1)),
+                "test_inference_sec": float(test_inference_sec),
+                "test_user_count": int(len(test_ds)),
+                "test_ms_per_user": float(1000.0 * test_inference_sec / max(len(test_ds), 1)),
+                "test_users_per_sec": float(len(test_ds) / max(test_inference_sec, 1.0e-12)),
+                "peak_cuda_memory_mb": (
+                    float(torch.cuda.max_memory_allocated(device) / (1024**2))
+                    if device.type == "cuda"
+                    else 0.0
+                ),
+            }
+        )
 
     save_json(summary, run_dir / "metrics_summary.json")
     print("========== Finished ==========")

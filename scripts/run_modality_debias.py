@@ -12,6 +12,9 @@ Supported base models:
     --base_model latefusion_sasrec
     --base_model latefusion_gru4rec
     --base_model latefusion_bert4rec
+    --base_model fare_sasrec
+    --base_model fare_gru4rec
+    --base_model fare_bert4rec
 
 Recommended usage for pretrained multimodal baselines:
 
@@ -67,6 +70,8 @@ from modality_debias import (  # type: ignore
     LateFusionSequentialBase,
     ModalityDebiasWrapper,
 )
+from revision_checkpoint_audit import validate_fare_checkpoint_source  # type: ignore
+from run_fare import run_saved_topk_fairness_eval  # type: ignore
 
 try:
     from run_id_backbone import (  # type: ignore
@@ -193,7 +198,8 @@ def pairwise_collate_fn(max_seq_len: int):
             l = int(prefix.numel())
             lengths[i] = l
             if l > 0:
-                seqs[i, -l:] = prefix
+                # Keep right padding; SASRec's causal mask can produce NaNs with left padding.
+                seqs[i, :l] = prefix
 
         return {
             "user_ids": torch.stack([x["user_ids"] for x in batch], dim=0),
@@ -228,9 +234,13 @@ def parse_args() -> argparse.Namespace:
             "latefusion_sasrec",
             "latefusion_gru4rec",
             "latefusion_bert4rec",
+            "fare_sasrec",
+            "fare_gru4rec",
+            "fare_bert4rec",
         ],
     )
     parser.add_argument("--run_id", type=str, default=None)
+    parser.add_argument("--seed", type=int, default=None)
 
     # Checkpoint loading.
     parser.add_argument(
@@ -257,6 +267,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval_batch_size", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--weight_decay", type=float, default=None)
+    parser.add_argument("--num_layers", type=int, default=None)
     parser.add_argument("--patience", type=int, default=None)
     parser.add_argument("--eval_every", type=int, default=None)
     parser.add_argument("--num_workers", type=int, default=None)
@@ -282,6 +293,10 @@ def apply_overrides(cfg: Dict[str, Any], args: argparse.Namespace) -> Dict[str, 
     cfg.setdefault("train", {})
     cfg.setdefault("eval", {})
     cfg.setdefault("modality_debias", {})
+    cfg.setdefault("model", {})
+
+    if args.seed is not None:
+        cfg["seed"] = int(args.seed)
 
     if args.base_model is not None:
         cfg["base_model"] = args.base_model
@@ -296,6 +311,8 @@ def apply_overrides(cfg: Dict[str, Any], args: argparse.Namespace) -> Dict[str, 
         cfg["train"]["learning_rate"] = args.lr
     if args.weight_decay is not None:
         cfg["train"]["weight_decay"] = args.weight_decay
+    if args.num_layers is not None:
+        cfg["model"]["num_layers"] = args.num_layers
     if args.patience is not None:
         cfg["train"]["patience"] = args.patience
     if args.eval_every is not None:
@@ -371,6 +388,7 @@ def load_checkpoint_if_needed(
     device: torch.device,
     label: str = "Checkpoint",
     strict: bool = False,
+    require_full_match: bool = False,
 ) -> nn.Module:
     if not path:
         return model
@@ -383,13 +401,44 @@ def load_checkpoint_if_needed(
     state = unwrap_state_dict(ckpt)
     state, transform_name, matched = _best_matching_state(model, state)
 
-    missing, unexpected = model.load_state_dict(state, strict=strict)
+    model_state = model.state_dict()
+    compatible = {
+        key: value
+        for key, value in state.items()
+        if key in model_state and tuple(model_state[key].shape) == tuple(value.shape)
+    }
+    mismatched = sorted(
+        key
+        for key, value in state.items()
+        if key in model_state and tuple(model_state[key].shape) != tuple(value.shape)
+    )
+    missing, unexpected = model.load_state_dict(compatible, strict=strict)
+    coverage = len(compatible) / max(len(model_state), 1)
     print(f"[{label}] loaded: {ckpt_path}")
     print(f"[{label}] transform={transform_name}, matched_keys={matched}")
     print(f"[{label}] missing={len(missing)}, unexpected={len(unexpected)}, strict={strict}")
+    print(f"[{label}] target_key_coverage={coverage:.6f}, shape_mismatches={len(mismatched)}")
 
     if matched == 0:
         print(f"[Warning] {label} matched 0 keys. Check whether the checkpoint belongs to this model.")
+    if require_full_match and (missing or mismatched or len(compatible) != len(model_state)):
+        raise RuntimeError(
+            f"{label} failed strict coverage audit: matched={len(compatible)}/{len(model_state)}, "
+            f"missing={missing[:10]}, shape_mismatches={mismatched[:10]}"
+        )
+
+    model._checkpoint_load_audit = {  # type: ignore[attr-defined]
+        "checkpoint": str(ckpt_path),
+        "transform": transform_name,
+        "matched_target_keys": len(compatible),
+        "target_keys": len(model_state),
+        "target_key_coverage": float(coverage),
+        "missing_target_keys": list(missing),
+        "unexpected_loaded_keys": list(unexpected),
+        "shape_mismatches": mismatched,
+        "source_only_keys": sorted(set(state) - set(model_state)),
+        "require_full_match": bool(require_full_match),
+    }
 
     return model
 
@@ -548,6 +597,40 @@ def build_base_model(
             vision_weight=float(base_cfg.get("vision_weight", 0.05)),
         )
 
+    if base_model_name.startswith("fare_"):
+        from model_fare import FARE  # type: ignore
+
+        backbone = base_model_name.replace("fare_", "")
+        fare_cfg = cfg.get("fare", {})
+        return FARE(
+            num_items=num_items,
+            data_dir=data_dir,
+            group_num_classes=None,
+            max_seq_len=int(model_cfg.get("max_seq_len", 50)),
+            hidden_size=int(model_cfg.get("hidden_size", 128)),
+            num_layers=int(model_cfg.get("num_layers", 2)),
+            num_heads=int(model_cfg.get("num_heads", 2)),
+            dropout=float(model_cfg.get("dropout", 0.2)),
+            activation=str(model_cfg.get("activation", "gelu")),
+            layer_norm_eps=float(model_cfg.get("layer_norm_eps", 1.0e-12)),
+            tie_output_embedding=bool(model_cfg.get("tie_output_embedding", True)),
+            backbone_type=backbone,
+            mm_score_dim=int(fare_cfg.get("mm_score_dim", 64)),
+            fair_dim=int(fare_cfg.get("fair_dim", 128)),
+            projection_seed=int(fare_cfg.get("projection_seed", 2026)),
+            use_text=bool(fare_cfg.get("use_text", True)),
+            use_vision=bool(fare_cfg.get("use_vision", True)),
+            cache_projected_features=bool(fare_cfg.get("cache_projected_features", True)),
+            feature_chunk_size=int(fare_cfg.get("feature_chunk_size", 32768)),
+            encoder_hidden_dim=int(fare_cfg.get("encoder_hidden_dim", 128)),
+            encoder_dropout=float(fare_cfg.get("encoder_dropout", 0.1)),
+            fair_weight_init=float(fare_cfg.get("fair_weight_init", 0.01)),
+            max_fair_weight=float(fare_cfg.get("max_fair_weight", 0.1)),
+            residual_score_weight=float(fare_cfg.get("residual_score_weight", 1.0)),
+            learnable_fair_weight=bool(fare_cfg.get("learnable_fair_weight", True)),
+            normalize_representations=bool(fare_cfg.get("normalize_representations", True)),
+        )
+
     raise ValueError(f"Unsupported base_model={base_model_name!r}")
 
 
@@ -676,6 +759,17 @@ def main() -> None:
     if args.base_model:
         base_model_name = str(args.base_model)
 
+    if base_model_name.startswith("fare_") and not args.init_base_checkpoint:
+        raise ValueError(
+            "FARE+ModalityDebias requires --init_base_checkpoint pointing to a "
+            "validation-selected FARE checkpoint."
+        )
+
+    method_name = str(cfg.get("method_name", "ModalityDebias"))
+    if base_model_name.startswith("fare_"):
+        method_name = "FARE+ModalityDebias"
+    freeze_base = bool(args.freeze_base or cfg.get("freeze_base", False))
+
     paths_cfg = cfg.get("paths", {})
     datasets_config = resolve_path(paths_cfg.get("datasets_config", "configs/datasets.yaml"))
     datasets_cfg = load_yaml(datasets_config) if datasets_config.exists() else {}
@@ -699,6 +793,40 @@ def main() -> None:
     eval_cfg = cfg.get("eval", {})
     model_cfg = cfg.get("model", {})
     md_cfg = cfg.get("modality_debias", {})
+
+    checkpoint_source_audit = None
+    if base_model_name.startswith("fare_"):
+        checkpoint_source_audit = validate_fare_checkpoint_source(
+            resolve_path(args.init_base_checkpoint),
+            expected_dataset=dataset,
+            expected_backbone=base_model_name.replace("fare_", ""),
+            expected_num_items=num_items,
+            expected_model={
+                key: model_cfg[key]
+                for key in (
+                    "max_seq_len",
+                    "hidden_size",
+                    "num_layers",
+                    "num_heads",
+                    "dropout",
+                    "activation",
+                    "layer_norm_eps",
+                    "tie_output_embedding",
+                )
+                if key in model_cfg
+            },
+            expected_fare={
+                key: cfg.get("fare", {})[key]
+                for key in (
+                    "mm_score_dim",
+                    "fair_dim",
+                    "encoder_hidden_dim",
+                    "use_text",
+                    "use_vision",
+                )
+                if key in cfg.get("fare", {})
+            },
+        )
 
     device_str = str(cfg.get("device", "cuda"))
     device = torch.device("cuda" if device_str.startswith("cuda") and torch.cuda.is_available() else "cpu")
@@ -770,7 +898,9 @@ def main() -> None:
         device,
         label=f"{base_model_name} base checkpoint",
         strict=False,
+        require_full_match=base_model_name.startswith("fare_"),
     )
+    checkpoint_load_audit = getattr(base_model, "_checkpoint_load_audit", None)
 
     model = ModalityDebiasWrapper(
         base_model=base_model,
@@ -799,7 +929,7 @@ def main() -> None:
         debias_max=float(md_cfg.get("debias_max", 1.0)),
     ).to(device)
 
-    if args.freeze_base:
+    if freeze_base:
         freeze_module(model.base_model)
         model.base_model.eval()
 
@@ -820,7 +950,7 @@ def main() -> None:
     resolved.update(
         {
             "dataset": dataset,
-            "method": "ModalityDebias",
+            "method": method_name,
             "base_model": base_model_name,
             "model_name": run_name,
             "run_id": run_id,
@@ -833,7 +963,9 @@ def main() -> None:
             "device_resolved": str(device),
             "init_backbone_checkpoint": args.init_backbone_checkpoint,
             "init_base_checkpoint": args.init_base_checkpoint,
-            "freeze_base": bool(args.freeze_base),
+            "freeze_base": freeze_base,
+            "checkpoint_source_audit": checkpoint_source_audit,
+            "checkpoint_load_audit": checkpoint_load_audit,
             "trainable_parameters": int(count_trainable_parameters(model)),
             "total_parameters": int(sum(p.numel() for p in model.parameters())),
         }
@@ -851,7 +983,7 @@ def main() -> None:
     print(f"train samples: {len(train_ds)}")
     print(f"parameters:    {sum(p.numel() for p in model.parameters()):,}")
     print(f"trainable:     {count_trainable_parameters(model):,}")
-    print(f"freeze_base:   {args.freeze_base}")
+    print(f"freeze_base:   {freeze_base}")
     print(f"device:        {device}")
 
     epochs = int(train_cfg.get("epochs", 100))
@@ -884,7 +1016,7 @@ def main() -> None:
             device=device,
             grad_clip_norm=grad_clip_norm,
             train_on_fused=train_on_fused,
-            freeze_base=bool(args.freeze_base),
+            freeze_base=freeze_base,
             log_every=log_every,
         )
 
@@ -966,9 +1098,10 @@ def main() -> None:
         print("[Warning] best_model.pt was not saved; using last epoch model.")
         torch.save({"model_state_dict": model.state_dict(), "epoch": epochs}, best_path)
 
+    epoch_times = [float(row["epoch_time_sec"]) for row in logs]
     summary: Dict[str, object] = {
         "dataset": dataset,
-        "method": "ModalityDebias",
+        "method": method_name,
         "base_model": base_model_name,
         "model_name": run_name,
         "run_id": run_id,
@@ -982,7 +1115,21 @@ def main() -> None:
         "num_test_samples": int(len(test_ds)),
         "init_backbone_checkpoint": args.init_backbone_checkpoint,
         "init_base_checkpoint": args.init_base_checkpoint,
-        "freeze_base": bool(args.freeze_base),
+        "freeze_base": freeze_base,
+        "checkpoint_source_audit": checkpoint_source_audit,
+        "checkpoint_load_audit": checkpoint_load_audit,
+        "efficiency": {
+            "total_parameters": int(sum(p.numel() for p in model.parameters())),
+            "trainable_parameters": int(sum(p.numel() for p in model.parameters() if p.requires_grad)),
+            "mean_epoch_sec": float(np.mean(epoch_times)) if epoch_times else 0.0,
+            "total_train_sec": float(sum(epoch_times)),
+            "peak_cuda_memory_mb": (
+                float(torch.cuda.max_memory_allocated(device) / (1024**2)) if device.type == "cuda" else 0.0
+            ),
+            "torch_version": str(torch.__version__),
+            "cuda_version": str(torch.version.cuda),
+            "gpu_name": torch.cuda.get_device_name(device) if device.type == "cuda" else "cpu",
+        },
     }
 
     if bool(eval_cfg.get("run_test_after_training", True)):
@@ -991,6 +1138,9 @@ def main() -> None:
         val_topk_path = run_dir / "topk_val.npz" if save_topk_npz else None
         test_topk_path = run_dir / "topk_test.npz" if save_topk_npz else None
 
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        val_start = time.perf_counter()
         val_final = evaluate_full_sort(
             model=model,
             loader=val_loader,
@@ -1001,6 +1151,13 @@ def main() -> None:
             seen_items=seen_train,
             save_topk_path=val_topk_path,
         )
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        val_inference_sec = time.perf_counter() - val_start
+
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        test_start = time.perf_counter()
         test_final = evaluate_full_sort(
             model=model,
             loader=test_loader,
@@ -1011,9 +1168,61 @@ def main() -> None:
             seen_items=seen_train,
             save_topk_path=test_topk_path,
         )
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        test_inference_sec = time.perf_counter() - test_start
 
         summary["val"] = val_final
         summary["test"] = test_final
+        summary["efficiency"].update({
+            "val_inference_sec": float(val_inference_sec),
+            "val_user_count": int(len(val_ds)),
+            "val_ms_per_user": float(1000.0 * val_inference_sec / max(len(val_ds), 1)),
+            "val_users_per_sec": float(len(val_ds) / max(val_inference_sec, 1.0e-12)),
+            "test_inference_sec": float(test_inference_sec),
+            "test_user_count": int(len(test_ds)),
+            "test_ms_per_user": float(1000.0 * test_inference_sec / max(len(test_ds), 1)),
+            "test_users_per_sec": float(len(test_ds) / max(test_inference_sec, 1.0e-12)),
+            "peak_cuda_memory_mb": (
+                float(torch.cuda.max_memory_allocated(device) / (1024**2))
+                if device.type == "cuda"
+                else 0.0
+            ),
+        })
+
+    if bool(eval_cfg.get("run_fairness_eval", False)):
+        if save_topk_npz and "val" in summary:
+            fairness_splits = ["val"]
+            if "test" in summary:
+                fairness_splits.append("test")
+            summary["fairness_eval"] = run_saved_topk_fairness_eval(
+                data_dir=data_dir,
+                run_dir=run_dir,
+                dataset=dataset,
+                run_name=run_name,
+                run_id=run_id,
+                splits=fairness_splits,
+                ks=ks,
+                group_spec=eval_cfg.get("fairness_groups", "all"),
+            )
+        else:
+            summary["fairness_eval"] = {
+                "status": "skipped",
+                "message": "Fairness evaluation requires saved validation Top-K artifacts.",
+            }
+        if base_model_name.startswith("fare_"):
+            fairness_audit = summary["fairness_eval"]
+            split_statuses = [
+                value.get("status")
+                for value in fairness_audit.get("splits", {}).values()
+            ]
+            if fairness_audit.get("status") != "ok" or any(
+                status != "ok" for status in split_statuses
+            ):
+                raise RuntimeError(
+                    "FARE+ModalityDebias fairness evaluation failed: "
+                    + json.dumps(fairness_audit, ensure_ascii=False)
+                )
 
     save_json(summary, run_dir / "metrics_summary.json")
 
