@@ -1,0 +1,134 @@
+# Single source of truth for the IPM major-revision experiment protocol.
+protocol_version: ipm-major-revision-v2
+datasets_config: configs/datasets.yaml
+
+seeds:
+  breadth: [2024, 2025, 2026]
+  confirmatory: [2024, 2025, 2026, 2027, 2028, 2029]
+
+datasets:
+  main: [Video_Games, Musical_Instruments, Baby_Products]
+  external: [MicroLens_100K]
+
+backbones: [sasrec, gru4rec, bert4rec]
+
+# Architecture fields must match the corresponding ID checkpoint exactly.
+model_overrides_by_backbone:
+  gru4rec:
+    num_layers: 1
+
+# Preserve the invalid legacy GRU FARE artifacts for audit instead of
+# overwriting them during the architecture-corrected rerun.
+run_tag_by_backbone:
+  gru4rec: archfix_topkfix_v1
+
+run_tag_by_method:
+  FairRR: fairrrfix_v1
+
+runner_configs:
+  fare_default: configs/fare_3090.yaml
+  fare_by_dataset:
+    MicroLens_100K: configs/revision/microlens_fare_3090.yaml
+
+# Six paired seeds are reserved for the claims subjected to exact sign-flip
+# tests. This scope keeps the full non-Amazon/backbone generalization test,
+# retains the Amazon SASRec primary setting, and adds Baby Products+BERT4Rec
+# because that weak/negative setting is singled out in the revision audit.
+confirmatory_scope:
+  Video_Games: [sasrec]
+  Musical_Instruments: [sasrec]
+  Baby_Products: [sasrec, bert4rec]
+  MicroLens_100K: [sasrec, gru4rec, bert4rec]
+
+fairness_metrics:
+  group_gap_aggregate: utility_aware_gap
+  metrics:
+    coverage:
+      artifact_key: summary@{k}/catalog_coverage
+      direction: higher
+    rec_gini:
+      artifact_key: summary@{k}/recommendation_gini
+      direction: lower
+    pop_gap:
+      group: popularity_group
+      direction: lower
+    brand_gap:
+      group: brand_store_proxy_group
+      direction: lower
+    cluster_gap:
+      group: multimodal_cluster_proxy_group
+      direction: lower
+
+findrec_tuning:
+  validation_only: true
+  learning_rates: [0.0003, 0.001]
+  weight_decays: [0.0, 0.01]
+
+model_selection:
+  split: val
+  metric: ndcg@10
+  policy_primary_alpha: 0.5
+  policy_sensitivity_alphas: [0.25, 0.4, 0.5, 0.6, 0.75]
+  aggregate_seeds_before_selection: true
+
+final_evaluation:
+  test_once_after_selection: true
+  metrics: [hit@5, hit@10, hit@20, ndcg@5, ndcg@10, ndcg@20]
+  topk_for_exposure: [10, 20]
+
+exposure_reweighting:
+  primary_source: reference_topk
+  gamma_grid: [0.0, 0.02, 0.05, 0.1, 0.2, 0.4, 0.8]
+  groups: [popularity_group, multimodal_cluster_proxy_group]
+  source_by_platform:
+    amazon: train_popularity
+    short_video: platform_views
+  independent_prior_control: true
+
+statistics:
+  paired_by_user: true
+  ci_mode: seed
+  bootstrap_levels: [seed]
+  optional_hierarchical_bootstrap_levels: [seed, user]
+  bootstrap_samples: 10000
+  confidence_level: 0.95
+  exact_sign_flip_max_pairs: 20
+  report_effect_size: true
+
+experiments:
+  primary: [ID, FARE]
+  controls: [ExposureReweight-ID]
+  rerankers: [FairRR]
+  diagnostic_baselines: [FindRec]
+  compositions: [FARE+ModalityDebias]
+  ablations:
+    - no_multimodal_residual
+    - no_exposure_reweighting
+    - text_only
+    - vision_only
+    - reference_topk_prior
+    - independent_platform_or_train_prior
+
+artifact_contract:
+  required_run_files:
+    - config_resolved.json
+    - train_log.csv
+    - metrics_summary.json
+    - topk_val.npz
+    - topk_test.npz
+  selection_artifact: topk_val.npz
+  final_artifact: topk_test.npz
+  result_manifest_columns: [dataset, backbone, method, seed, split, run_dir]
+
+reviewer_coverage:
+  wider_hyperparameter_range: exposure_reweighting.gamma_grid
+  explicit_backbones: backbones
+  non_amazon_validation: datasets.external
+  significance_and_ci: statistics
+  tuning_leakage: model_selection
+  id_reweight_control: experiments.controls
+  circular_exposure_reference: exposure_reweighting.source_by_platform
+  fare_modality_debias: experiments.compositions
+  fairrr_identical_results: experiments.rerankers
+  findrec_anomaly: experiments.diagnostic_baselines
+  efficiency: artifact_contract

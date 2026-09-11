@@ -1,0 +1,22 @@
+# Validation-only FindRec tuning template. The unified revision job builder
+# replaces dataset and seed for every breadth-tier run.
+name: findrec_tuning
+script: scripts/run_findrec.py
+sampler: grid
+seed: 2026
+static_args:
+  config: configs/findrec_3090.yaml
+  dataset: Video_Games
+  seed: 2024
+  skip_test_after_training: true
+  no_fairness_eval: true
+search_space:
+  lr: [0.0003, 0.001]
+  weight_decay: [0.0, 0.01]
+run_id:
+  prefix: findrec_tuning
+  include_params: [lr, weight_decay]
+metric:
+  key: best_metric
+  mode: max
+  file_template: results/{dataset}/findrec/{run_id}/metrics_summary.json
