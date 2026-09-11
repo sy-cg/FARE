@@ -1,0 +1,20 @@
+# Wide exposure-reweighting sweep. Paths to seed-specific validation-selected
+# backbone checkpoints are supplied through the run registry, not hard-coded.
+runner: scripts/run_fare.py
+base_config: configs/fare_3090.yaml
+datasets: [Video_Games, Musical_Instruments, Baby_Products, MicroLens_100K]
+backbones: [sasrec, gru4rec, bert4rec]
+seeds: [2024, 2025, 2026]
+gamma_values: [0.0, 0.02, 0.05, 0.1, 0.2, 0.4, 0.8]
+groups: [popularity_group, multimodal_cluster_proxy_group]
+primary_exposure_source: reference_topk
+independent_exposure_sources:
+  Video_Games: train_popularity
+  Musical_Instruments: train_popularity
+  Baby_Products: train_popularity
+  MicroLens_100K: platform_views
+selection_split: val
+selection_metric: ndcg@10
+selection_artifacts: topk_val.npz
+required_registry_columns: [dataset, backbone, seed, init_backbone_checkpoint, reference_topk_path]
+device_profile: rtx3090_24gb

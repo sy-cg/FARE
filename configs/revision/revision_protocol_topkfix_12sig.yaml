@@ -1,0 +1,5 @@
+confirmatory_scope:
+  Video_Games: [sasrec, gru4rec, bert4rec]
+  Musical_Instruments: [sasrec, gru4rec, bert4rec]
+  Baby_Products: [sasrec, gru4rec, bert4rec]
+  MicroLens_100K: [sasrec, gru4rec, bert4rec]
