@@ -554,9 +554,7 @@ class ModalityDebiasWrapper(nn.Module):
         low score  -> larger rank
         """
         order = torch.argsort(scores, dim=1, descending=True)
-        ranks = torch.empty_like(order, dtype=torch.float32)
-        vals = torch.arange(scores.size(1), device=scores.device, dtype=torch.float32)
-        ranks.scatter_(1, order, vals.unsqueeze(0).expand_as(ranks))
+        ranks = torch.argsort(order, dim=1).to(dtype=torch.float32)
 
         if self.rank_normalize:
             ranks = ranks / float(max(scores.size(1) - 1, 1))

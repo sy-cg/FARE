@@ -135,6 +135,7 @@ def find_group_metadata_file(data_dir: str | Path, explicit_path: Optional[str |
         return p if p.exists() else None
 
     candidates = [
+        "group_schema.json",
         "fairness_groups.json",
         "fairness_metadata.json",
         "group_metadata.json",
@@ -235,6 +236,16 @@ def infer_group_columns_from_metadata(metadata: Optional[Dict], group_names: Seq
                 cols = _columns_from_spec(block.get(g))
                 if cols is not None:
                     result[g] = cols
+
+    column_schema = metadata.get("item_group_matrix_columns")
+    if isinstance(column_schema, list):
+        for entry in column_schema:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("group_name") or entry.get("name") or entry.get("key")
+            column = entry.get("column")
+            if name in group_names and column is not None:
+                result.setdefault(str(name), []).append(int(column))
 
     return result
 
@@ -508,6 +519,33 @@ def ranking_metrics_from_ranks(ranks: np.ndarray, ks: Sequence[int]) -> Dict[str
     return out
 
 
+def aggregate_exposure_penalty(
+    topk_items: np.ndarray,
+    group_matrix: np.ndarray,
+    cfg: FairRerankConfig,
+) -> float:
+    """Return the global discounted exposure deviation used for validation selection."""
+    topk = np.asarray(topk_items, dtype=np.int64)
+    if topk.ndim != 2:
+        raise ValueError("topk_items must be 2-D")
+    k = min(int(cfg.top_k), topk.shape[1])
+    if k <= 0:
+        raise ValueError("top_k must be positive")
+    if np.any(topk[:, :k] < 0) or np.any(topk[:, :k] >= group_matrix.shape[0]):
+        raise ValueError("topk_items contain out-of-range item ids")
+
+    groups = (
+        normalize_group_rows(group_matrix)
+        if cfg.normalize_group_rows
+        else group_matrix.astype(np.float32, copy=False)
+    )
+    target = compute_target_distribution(groups, mode=cfg.target_distribution)
+    discounts = rank_discounts(k, mode=cfg.discount)
+    exposure = np.zeros(groups.shape[1], dtype=np.float32)
+    for rank in range(k):
+        exposure += float(discounts[rank]) * groups[topk[:, rank]].sum(axis=0)
+    return float(exposure_penalty(exposure.reshape(1, -1), target, mode=cfg.penalty)[0])
+
 def rerank_topk_data(
     topk_data: Dict[str, np.ndarray],
     group_matrix: np.ndarray,
@@ -520,10 +558,17 @@ def rerank_topk_data(
     targets = topk_data["targets"].astype(np.int64, copy=False).reshape(-1)
     user_ids = topk_data.get("user_ids", np.arange(topk_items.shape[0], dtype=np.int64)).astype(np.int64, copy=False)
 
+    if topk_items.ndim != 2:
+        raise ValueError("topk_items must be 2-D")
+    if group_matrix.ndim != 2:
+        raise ValueError("group_matrix must be 2-D")
     if topk_items.shape[0] != targets.shape[0]:
         raise ValueError(f"topk_items rows {topk_items.shape[0]} != targets length {targets.shape[0]}")
 
     candidate_k = min(int(cfg.candidate_k), topk_items.shape[1])
+    candidates = topk_items[:, :candidate_k]
+    if np.any(candidates < 0) or np.any(candidates >= group_matrix.shape[0]):
+        raise ValueError("topk_items contain out-of-range item ids")
     top_k = min(int(cfg.top_k), candidate_k)
     cfg = FairRerankConfig(**{**asdict(cfg), "top_k": top_k, "candidate_k": candidate_k})
 
@@ -551,8 +596,7 @@ def rerank_topk_data(
             rng=rng,
         )
 
-    fallback_ranks = topk_data.get("ranks")
-    ranks = compute_ranks_from_topk(reranked, targets, fallback_ranks=fallback_ranks)
+    ranks = compute_ranks_from_topk(reranked, targets)
     metrics = ranking_metrics_from_ranks(ranks, ks=ks)
 
     out = {

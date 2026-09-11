@@ -6,7 +6,7 @@ A clean SASRec-ID baseline implementation.
 
 Design choices:
 - Item id 0 is padding.
-- Input sequences are left-padded and left-truncated by the data loader.
+- Input sequences are right-padded and left-truncated by the data loader.
 - The final hidden state at the last position is used for next-item prediction.
 - full_sort_scores returns logits over all items, including padding item 0.
   The evaluator masks item 0; the loss masks item 0.

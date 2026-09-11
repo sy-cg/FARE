@@ -308,7 +308,12 @@ class FARE(nn.Module):
         self.fair_dim = int(fair_dim)
         self.use_text = bool(use_text)
         self.use_vision = bool(use_vision)
+        fair_weight_init = float(fair_weight_init)
         self.max_fair_weight = float(max_fair_weight)
+        if self.max_fair_weight < 0.0:
+            raise ValueError(f"max_fair_weight must be non-negative, got {self.max_fair_weight}")
+        if self.max_fair_weight == 0.0 and fair_weight_init != 0.0:
+            raise ValueError("fair_weight_init must be 0.0 when max_fair_weight is 0.0")
         self.residual_score_weight = float(residual_score_weight)
         self.learnable_fair_weight = bool(learnable_fair_weight)
         self.normalize_representations = bool(normalize_representations)
@@ -391,8 +396,11 @@ class FARE(nn.Module):
         # Bounded residual weight
         # -------------------------
         if self.learnable_fair_weight:
+            raw_fair_weight = 0.0
+            if self.max_fair_weight > 0.0:
+                raw_fair_weight = _init_logit_from_weight(fair_weight_init, self.max_fair_weight)
             self.raw_fair_weight = nn.Parameter(
-                torch.tensor(_init_logit_from_weight(fair_weight_init, max_fair_weight))
+                torch.tensor(raw_fair_weight)
             )
         else:
             self.register_buffer(
@@ -529,6 +537,9 @@ class FARE(nn.Module):
         raw = self.raw_fair_weight
         if not torch.isfinite(raw).all():
             raise FloatingPointError(f"Non-finite raw_fair_weight: {raw}")
+
+        if self.max_fair_weight == 0.0:
+            return raw.new_zeros(())
 
         if self.learnable_fair_weight:
             return self.max_fair_weight * torch.sigmoid(raw.clamp(min=-20.0, max=20.0))
