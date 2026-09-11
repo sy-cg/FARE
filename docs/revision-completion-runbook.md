@@ -1,4 +1,4 @@
-# IPM revision completion runbook
+# revision completion runbook
 
 This runbook is the ordered command list for the corrected revision experiments after the GRU4Rec architecture audit. It assumes the server working directory is `/root/FARE` and that GPU jobs are run on the experiment server, not on the Windows editing machine.
 
