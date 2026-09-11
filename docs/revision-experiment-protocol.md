@@ -1,4 +1,4 @@
-# IPM Major Revision 实验执行手册
+# Revision 实验执行手册
 
 本手册以 `configs/revision/revision_protocol.yaml` 为唯一协议源。任何正式结果都必须满足：验证集选择、冻结政策、一次性测试、配对种子、完整产物审计。
 
@@ -166,15 +166,3 @@ bash scripts/server/smoke_microlens_three_backbones.sh
 
 脚本依次对 MicroLens-100K 的 SASRec、GRU4Rec、BERT4Rec 运行 1 epoch ID 与 FARE，并检查 checkpoint、验证/测试 Top-K、公平 flat metrics，最终写入 `revision_outputs/server_smoke/smoke_audit.csv`。
 
-## 审稿问题与证据
-
-| 审稿问题 | 证据 |
-|---|---|
-| 更宽超参数范围 | 7 点 gamma sweep、`policy_sensitivity.csv` |
-| 三骨干与非 Amazon 泛化 | breadth 全矩阵、MicroLens 三骨干 confirmatory |
-| 显著性和置信区间 | 六配对种子、`significance.csv` |
-| ID 重加权控制 | `ExposureReweight-ID` |
-| 曝光参考循环性 | train-popularity/platform-view 独立先验 |
-| FARE+MD | checkpoint audit、公平评估产物 |
-| FindRec 异常 | tuning audit、learning curve、collapse audit |
-| 效率 | `efficiency.csv` 与曝光权重构建耗时 |
